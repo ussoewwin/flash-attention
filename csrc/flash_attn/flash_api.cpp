@@ -2,8 +2,9 @@
  * Copyright (c) 2024, Tri Dao.
  ******************************************************************************/
 
-// Include these 2 headers instead of torch/extension.h since we don't need all of the torch headers.
-#include <torch/python.h>
+// PyTorch 2.13.0 build compat (see md/CUDA_13.0_TO_13.2_BUILD_FIX.md):
+// torch/python.h fails to compile with torch 2.13 + CUDA 13.2, so use torch/extension.h.
+#include <torch/extension.h>
 #include <torch/nn/functional.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
@@ -18,7 +19,7 @@
 #include "static_switch.h"
 
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
-#define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
+#define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes().equals(torch::IntArrayRef({__VA_ARGS__})), #x " must have shape (" #__VA_ARGS__ ")")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
 namespace FLASH_NAMESPACE {
@@ -338,7 +339,7 @@ void set_params_alibi(Flash_fwd_params &params, std::optional<at::Tensor> &alibi
         TORCH_CHECK(alibi_slopes.dtype() == torch::kFloat32, "ALiBi slopes must have dtype fp32");
         CHECK_DEVICE(alibi_slopes);
         TORCH_CHECK(alibi_slopes.stride(-1) == 1, "ALiBi slopes tensor must have contiguous last dimension");
-        TORCH_CHECK(alibi_slopes.sizes() == torch::IntArrayRef({num_heads}) || alibi_slopes.sizes() == torch::IntArrayRef({batch_size, num_heads}));
+        TORCH_CHECK(alibi_slopes.sizes().equals(torch::IntArrayRef({num_heads})) || alibi_slopes.sizes().equals(torch::IntArrayRef({batch_size, num_heads})));
         params.alibi_slopes_ptr = alibi_slopes.data_ptr();
         params.alibi_slopes_batch_stride = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
     } else {

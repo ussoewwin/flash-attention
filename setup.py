@@ -69,9 +69,42 @@ if IS_ROCM:
     ROCM_BACKEND = "triton" if os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE" else "ck"
 NVCC_THREADS = os.getenv("NVCC_THREADS") or "4"
 
+# FA2 fork wheel build: SASS for Ampere/Hopper/Blackwell only (see md/CUDA_13.0_TO_13.2_BUILD_FIX.md).
+FORK_SUPPORTED_CUDA_ARCHS = ("80", "90", "100", "120")
+FORK_THOR_CUDA_ARCHS = frozenset({"101", "110"})
+
+
 @functools.lru_cache(maxsize=None)
-def cuda_archs() -> str:
-    return os.getenv("FLASH_ATTN_CUDA_ARCHS", "80;90;100;110;120").split(";")
+def cuda_archs() -> list[str]:
+    raw = os.getenv("FLASH_ATTN_CUDA_ARCHS", "80;90;100;120")
+    requested = [a.strip() for a in raw.split(";") if a.strip()]
+    dropped_thor = [a for a in requested if a in FORK_THOR_CUDA_ARCHS]
+    if dropped_thor:
+        warnings.warn(
+            "FLASH_ATTN_CUDA_ARCHS includes Thor GPU arch(es) "
+            f"{dropped_thor}; this fork FA2 build emits SASS for "
+            f"{list(FORK_SUPPORTED_CUDA_ARCHS)} only. Ignoring those entries.",
+            stacklevel=2,
+        )
+    archs = [a for a in requested if a in FORK_SUPPORTED_CUDA_ARCHS]
+    unknown = [
+        a
+        for a in requested
+        if a not in FORK_SUPPORTED_CUDA_ARCHS and a not in FORK_THOR_CUDA_ARCHS
+    ]
+    if unknown:
+        warnings.warn(
+            f"FLASH_ATTN_CUDA_ARCHS entries ignored (not built by this fork): {unknown}",
+            stacklevel=2,
+        )
+    if not archs:
+        warnings.warn(
+            "FLASH_ATTN_CUDA_ARCHS has no supported entries after filtering; "
+            f"using default {list(FORK_SUPPORTED_CUDA_ARCHS)}.",
+            stacklevel=2,
+        )
+        archs = list(FORK_SUPPORTED_CUDA_ARCHS)
+    return archs
 
 
 def get_platform():
@@ -103,9 +136,9 @@ def add_cuda_gencodes(cc_flag, archs, bare_metal_version):
     Adds -gencode flags based on nvcc capabilities:
       - sm_80/90 (regular)
       - sm_100/120 on CUDA >= 12.8
-      - Use 100f on CUDA >= 12.9 (Blackwell family-specific)
-      - Map requested 110 -> 101 if CUDA < 13.0 (Thor rename)
+      - Use 100f/120f on CUDA >= 12.9 (Blackwell family-specific)
       - Embed PTX for newest arch for forward compatibility
+      - Thor (sm_101/sm_110) is not built by this fork (see cuda_archs()).
     """
     # Always-regular 80
     if "80" in archs:
@@ -131,16 +164,7 @@ def add_cuda_gencodes(cc_flag, archs, bare_metal_version):
             else:
                 cc_flag += ["-gencode", "arch=compute_120,code=sm_120"]
 
-
-        # Thor rename: 12.9 uses sm_101; 13.0+ uses sm_110
-        if "110" in archs:
-            if bare_metal_version >= Version("13.0"):
-                cc_flag += ["-gencode", "arch=compute_110f,code=sm_110"]
-            else:
-                # Provide Thor support for CUDA 12.9 via sm_101
-                if bare_metal_version >= Version("12.8"):
-                    cc_flag += ["-gencode", "arch=compute_101,code=sm_101"]
-                # else: no Thor support in older toolkits
+        # Thor (sm_101/sm_110) is intentionally not built by this fork; see cuda_archs().
 
     # PTX for newest requested arch (forward-compat)
     numeric = [a for a in archs if a.isdigit()]
@@ -311,7 +335,7 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
 
     nvcc_flags = [
     "-O3",
-    "-std=c++17",
+    "-std=c++20",
     "-U__CUDA_NO_HALF_OPERATORS__",
     "-U__CUDA_NO_HALF_CONVERSIONS__",
     "-U__CUDA_NO_HALF2_OPERATORS__",
@@ -330,11 +354,21 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
     # "-DFLASHATTENTION_DISABLE_LOCAL",
     ]
 
-    compiler_c17_flag=["-O3", "-std=c++17"]
+    compiler_c17_flag = ["-O3", "-std=c++20"]
     # Add Windows-specific flags
-    if sys.platform == "win32" and os.getenv('DISTUTILS_USE_SDK') == '1':
-        nvcc_flags.extend(["-Xcompiler", "/Zc:__cplusplus"])
-        compiler_c17_flag=["-O2", "/std:c++17", "/Zc:__cplusplus"]
+    if sys.platform == "win32" and os.getenv("DISTUTILS_USE_SDK") == "1":
+        # CUDA 13.2 CCCL headers require MSVC conforming preprocessor
+        # (see md/CUDA_13.0_TO_13.2_BUILD_FIX.md). PyTorch 2.13 still omits
+        # /Zc:preprocessor from COMMON_MSVC_FLAGS, so add it explicitly.
+        nvcc_flags.extend(
+            ["-Xcompiler", "/Zc:__cplusplus", "-Xcompiler", "/Zc:preprocessor"]
+        )
+        compiler_c17_flag = [
+            "-O2",
+            "/std:c++20",
+            "/Zc:__cplusplus",
+            "/Zc:preprocessor",
+        ]
 
     ext_modules.append(
         CUDAExtension(
@@ -684,6 +718,31 @@ class CachedWheelsCommand(_bdist_wheel):
             super().run()
 
 
+def _ensure_msvc_conforming_preprocessor() -> None:
+    """Set CL so CCCL (CUDA 13.2) sees MSVC's conforming preprocessor."""
+    if sys.platform != "win32" or os.getenv("DISTUTILS_USE_SDK") != "1":
+        return
+    cl = os.environ.get("CL", "")
+    for flag in ("/Zc:__cplusplus", "/Zc:preprocessor"):
+        if flag not in cl:
+            cl = f"{cl} {flag}".strip()
+    os.environ["CL"] = cl
+
+
+def _inject_msvc_preprocessor_flags(cmd: list) -> list:
+    """Append /Zc:preprocessor to cl.exe/nvcc.exe invocations if missing."""
+    exe = Path(str(cmd[0])).name.lower()
+    if exe in ("cl.exe", "cl"):
+        for flag in ("/Zc:__cplusplus", "/Zc:preprocessor"):
+            if all(flag not in str(arg) for arg in cmd):
+                cmd.append(flag)
+    elif exe in ("nvcc.exe", "nvcc"):
+        joined = subprocess.list2cmdline([str(arg) for arg in cmd])
+        if "/Zc:preprocessor" not in joined:
+            cmd.extend(["-Xcompiler", "/Zc:__cplusplus", "-Xcompiler", "/Zc:preprocessor"])
+    return cmd
+
+
 class NinjaBuildExtension(BuildExtension):
     def __init__(self, *args, **kwargs) -> None:
         # do not override env MAX_JOBS if already exists
@@ -712,14 +771,20 @@ class NinjaBuildExtension(BuildExtension):
         super().__init__(*args, **kwargs)
 
     def build_extensions(self) -> None:
+        _ensure_msvc_conforming_preprocessor()
         original_spawn = None
         if sys.platform == "win32" and self.compiler.compiler_type == "msvc":
             original_spawn = self.compiler.spawn
 
             def spawn(cmd):
-                if not cmd or Path(str(cmd[0])).name.lower() != "link.exe":
+                if not cmd:
                     return original_spawn(cmd)
                 cmd = [str(arg) for arg in cmd]
+                exe = Path(cmd[0]).name.lower()
+                if exe in ("cl.exe", "cl", "nvcc.exe", "nvcc"):
+                    return original_spawn(_inject_msvc_preprocessor_flags(cmd))
+                if exe != "link.exe":
+                    return original_spawn(cmd)
                 if len(subprocess.list2cmdline(cmd)) <= 32767:
                     return original_spawn(cmd)
                 # Temporary workaround adapted from https://github.com/pypa/distutils/pull/406
