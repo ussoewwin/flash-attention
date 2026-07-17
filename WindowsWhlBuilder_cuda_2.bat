@@ -56,7 +56,7 @@ set DISTUTILS_USE_SDK=1
 set dist_dir=dist
 set FLASH_ATTN_CUDA_ARCHS=100;120;121
 
-python setup2.py bdist_wheel --dist-dir=%dist_dir%
+python setup.py bdist_wheel --dist-dir=%dist_dir%
 
 
 rem rename whl — tag matches installed torch (e.g. cu130torch2.11.0 for CUDA 13.0 + torch 2.11.0)
