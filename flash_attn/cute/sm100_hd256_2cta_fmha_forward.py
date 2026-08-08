@@ -15,7 +15,7 @@ from cutlass.cute.typing import Int32, Int64, Float32
 
 from cutlass.utils import ClcDynamicPersistentTileScheduler
 from flash_attn.cute.tile_scheduler import (
-    ClcState,
+    SchedulerState,
     compute_sm100_fmha_grid as compute_grid,
     compute_sm100_fmha_grid_clc as compute_grid_clc,
     make_sm100_thread_cooperative_group as make_thread_cooperative_group,
@@ -43,10 +43,11 @@ class BlackwellFusedMultiHeadAttentionForward:
         is_split_kv: bool = False,
         pack_gqa: bool = False,
         q_subtile_factor: int = 1,
+        kv_subtile_factor: int = 1,
         m_block_size: int = 128,
         n_block_size: int = 128,
         q_stage: int = 2,
-        is_persistent: bool = True,
+        is_static_persistent: bool = True,
         score_mod=None,
         mask_mod=None,
         has_aux_tensors: bool = False,
@@ -54,6 +55,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         is_varlen_q: bool = False,
         use_2cta_instrs: bool = False,
         use_clc_scheduler: bool = False,
+        has_tile_count_semaphore: bool = False,
+        seqlen_k_per_split: Optional[int] = None,
     ):
         head_dim_v = head_dim if head_dim_v is None else head_dim_v
         assert head_dim == 256 and head_dim_v == 256, (
@@ -69,6 +72,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         assert not is_split_kv, "SM100 forward with head_dim=256 does not support SplitKV"
         assert q_subtile_factor == 1, (
             "SM100 forward with head_dim=256 does not support q_subtile_factor"
+        )
+        assert kv_subtile_factor == 1, (
+            "SM100 forward with head_dim=256 does not support kv_subtile_factor"
         )
         assert m_block_size == 128 and n_block_size == 128, (
             "SM100 dedicated kernel only supports tile_m=128 and tile_n=128"
@@ -728,7 +734,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                 pipeline.Agent.Thread, num_clc_consumer_threads
             )
             clc_response_ptr = storage.clc_response.data_ptr()
-            clc = ClcState.create(
+            clc = SchedulerState.create_clc(
                 hw_scheduler=ClcDynamicPersistentTileScheduler.create(
                     self.tile_sched_params.clc_hw_params(),
                     cute.arch.block_idx(),
