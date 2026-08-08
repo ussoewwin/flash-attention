@@ -6,6 +6,13 @@
 
 #include <cmath>
 
+// MSVC does not expose M_* math constants unless _USE_MATH_DEFINES is set
+// before <cmath>. Upstream #2669 removed ATen CUDAGeneratorImpl from flash.h,
+// so those constants are no longer pulled in transitively on Windows nvcc builds.
+#ifndef M_LOG2E
+#define M_LOG2E 1.442695040888963407359924681001892137
+#endif
+
 #include <cute/tensor.hpp>
 
 #include <cutlass/numeric_types.h>

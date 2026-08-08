@@ -368,7 +368,11 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
             "/std:c++20",
             "/Zc:__cplusplus",
             "/Zc:preprocessor",
+            # M_LOG2E / M_LN2 etc. (same as hopper/setup.py); required after
+            # upstream #2669 stopped pulling ATen RNG headers into FA2 kernels.
+            "-D_USE_MATH_DEFINES",
         ]
+        nvcc_flags.append("-D_USE_MATH_DEFINES")
 
     # Opt-in: disable building dropout and its dependent headers (ATen philox/RNG
     # headers) from the FA2 build. This flag must be shared across both cxx and nvcc
