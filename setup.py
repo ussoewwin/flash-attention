@@ -377,14 +377,24 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
     # Add Windows-specific flags
     if sys.platform == "win32" and os.getenv('DISTUTILS_USE_SDK') == '1':
         # CUDA 13.2 CCCL headers require MSVC conforming preprocessor (see md/CUDA_13.0_TO_13.2_BUILD_FIX.md).
+        # -D_USE_MATH_DEFINES: MSVC needs this for M_LOG2E (softmax.h / flash_api.cpp).
+        # Same fix as hopper/setup.py; required after upstream #2669 stopped transitively
+        # defining M_LOG2E via ATen CUDAGeneratorImpl.
         nvcc_flags.extend(
-            ["-Xcompiler", "/Zc:__cplusplus", "-Xcompiler", "/Zc:preprocessor"]
+            [
+                "-D_USE_MATH_DEFINES",
+                "-Xcompiler",
+                "/Zc:__cplusplus",
+                "-Xcompiler",
+                "/Zc:preprocessor",
+            ]
         )
         compiler_c17_flag = [
             "-O2",
             "/std:c++20",
             "/Zc:__cplusplus",
             "/Zc:preprocessor",
+            "-D_USE_MATH_DEFINES",
         ]
 
     # Opt-in: disable building dropout and its dependent headers (ATen philox/RNG

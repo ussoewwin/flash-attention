@@ -14,6 +14,13 @@
 #include "philox.cuh"
 #include "utils.h"
 
+// MSVC does not expose M_LOG2E from <cmath> unless _USE_MATH_DEFINES is set.
+// Upstream #2669 stopped pulling ATen CUDAGeneratorImpl via flash.h, which had
+// previously defined this constant transitively on Windows builds.
+#ifndef M_LOG2E
+#define M_LOG2E 1.44269504088896340736
+#endif
+
 namespace FLASH_NAMESPACE {
 
 using namespace cute;
