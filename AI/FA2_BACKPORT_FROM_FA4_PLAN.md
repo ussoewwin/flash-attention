@@ -779,3 +779,1252 @@ SageAttention's quantization (`quant_per_block_int8` + smoothing) is more aggres
 - A new dQ / dK / dV reduction strategy that preserves int8 quantization through the gradient accumulation.
 
 This is research-scale work and is recorded only as a directional note.
+
+## 14. FA4 Sync Update (2026-08-11)
+
+This section records changes discovered in the upstream FA4 codebase (`flash_attn/cute/`) since the plan was originally written (2026-07-10). Each item is cross-referenced to the plan it affects. New plans are added to §5, §6, and §7 by reference.
+
+### 14.1 A-1 threshold: adopt FA4's float `rescale_threshold` (affects §5.1, §7.1)
+
+**Status:** Planned (supersedes the original A-1 threshold design).
+
+The original plan uses a bool template flag `Use_rescale_threshold` with a hard-coded `kRescaleSkipThreshold = -0.01f`. FA4 has since evolved `SoftmaxSm100.rescale_threshold` into a `cutlass.Constexpr[float]` (default `0.0`), set to `8.0` for fp16/bf16 and `0.0` for fp8 (`flash_attn/cute/flash_fwd_sm100.py` line ~2190, commit `849f660`).
+
+FA4's `8.0` means `scores_scale >= exp2(-8.0) = 0.0039` — far more aggressive than the plan's `0.01` (`scores_scale >= 0.993`). FA4 validated this on B200 across seqlen 256–4096 with both uniform and peaked softmax distributions.
+
+**Changes to the plan:**
+
+1. Replace the `bool Use_rescale_threshold` template parameter with `float RescaleThreshold = 0.0f` in `softmax_rescale_o`. The skip condition becomes `if constexpr (RescaleThreshold > 0.0f) { if (acc_scale_ >= -RescaleThreshold) { ... skip ... } }`.
+2. The four `Is_first=false` call sites in `flash_fwd_kernel.h` pass `/*RescaleThreshold=*/8.0f` (matching FA4's fp16/bf16 default).
+3. The `static_assert(!(Is_first && Use_rescale_threshold))` added by refinement A-1-R2 is replaced with `static_assert(!(Is_first && RescaleThreshold > 0.0f))`.
+4. The old `kRescaleSkipThreshold = -0.01f` constant and the refinement A-1-R1 (promoting it to file scope) are both superseded. They are no longer needed.
+5. Accuracy validation threshold in §8.1 for A-1 is tightened: the acceptance criterion changes from "relative L∞ <= 1e-2 for fp16" to "relative L∞ <= 2e-2 for fp16, <= 1e-2 for bf16" to accommodate the wider skip window. The end-to-end logits cosine threshold (>= 0.9995) is unchanged.
+
+**Risk:** The wider skip window means running `O` can lag by up to `exp2(-8.0) ≈ 0.4%` per skipped block in the worst case. FA4's B200 validation and the `max_offset + rescale_threshold < log2(dtype_max)` assert pattern (see §14.3) provide the safety bound. For fp16, `log2(65504) ≈ 15.99`, so `0 + 8.0 < 15.99` holds with margin.
+
+### 14.2 New plan A-4: packed `fmax_reduce` / `fadd_reduce` on sm_100+ (new entry in §5, §6, §7)
+
+**Status:** New plan, not in the original document.
+
+FA4's `utils.py::fmax_reduce` and `fadd_reduce` (lines ~368–455) now branch on `arch >= 100`:
+
+- `fmax_reduce` on sm_100+: uses 3-input `fmax(a, b, c)` to reduce 8 elements per iteration into 4 accumulators, then collapses with 3-input `fmax`. This replaces the 2-input `fmax` + serial reduction on sm_80.
+- `fadd_reduce` on sm_100+: uses `cute.arch.add_packed_f32x2` to add pairs of elements in one instruction, halving the add count.
+
+FA2's `softmax.h` has equivalent reductions (`reduce_max`, `reduce_sum`, `Allreduce`) that are arch-agnostic scalar loops. They run inside the softmax inner loop and are a measurable fraction of the non-MMA arithmetic.
+
+**Design:**
+
+| Item | Detail |
+|---|---|
+| Location | `csrc/flash_attn/src/softmax.h` — `reduce_max`, `reduce_sum`, `Allreduce` |
+| sm_100+ path | `fmax_3way(a, b, c)` PTX inline asm for max; `fma_f32x2`-based packed add for sum |
+| sm_80/86/89/90 path | Unchanged scalar code (binary identical) |
+| Guard | `#if __CUDA_ARCH__ >= 1000 && !defined(UNFUSE_FMA)` (same as A-2) |
+| Helper reuse | Uses `fma_f32x2` from A-2 for the sum reduction. New `fmax_3way` helper added alongside it. |
+| SASS gate | `FMNMX.X2` or equivalent 3-input max SASS mnemonic present on sm_120 in the reduction symbols |
+
+**fmax_3way helper:**
+
+```cpp
+__forceinline__ __device__ float fmax_3way(float a, float b, float c) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+    float result;
+    asm("max.f32 %0, %1, %2;\n\t"
+        "max.f32 %0, %0, %3;\n\t"
+        : "=f"(result) : "f"(a), "f"(b), "f"(c));
+    return result;
+    // Note: PTX does not have a 3-input max; this is two dependent max instructions.
+    // On sm_100+ the scheduler can overlap the two with other work in the reduction loop.
+    // FA4 uses the same pattern via cute.arch.fmax(a, b, c).
+#else
+    return fmaxf(fmaxf(a, b), c);
+#endif
+}
+```
+
+**Performance expectation:** 1–3% on sm_120, complementary to A-2's 1–5%. The reductions are smaller than `scale_apply_exp2` but run every block iteration.
+
+**Phase placement:** Phase 1 (alongside A-2, since it shares the `fma_f32x2` helper). Gating: SASS inspection shows packed max/add instructions in the reduction symbols on sm_120.
+
+### 14.3 A-3: add `max_offset + rescale_threshold` assert (affects §5.3, §7.3)
+
+**Status:** Planned (additive to existing A-3).
+
+FA4 commit `849f660` added:
+
+```python
+assert max_offset + rescale_threshold < _LOG2_DTYPE_MAX[self.q_dtype], (
+    f"max_offset ({max_offset}) + rescale_threshold ({rescale_threshold}) must stay "
+    f"below log2(max {self.q_dtype} value) to avoid saturating P"
+)
+```
+
+with a `_LOG2_DTYPE_MAX` table for fp16, bf16, fp8e4m3, fp8e5m2.
+
+**Change to the plan:** Add the equivalent `static_assert` in `softmax.h`:
+
+```cpp
+// fp16: log2(65504) ≈ 15.99, bf16: log2(3.39e38) ≈ 128.0
+// With RescaleThreshold=8.0 and MaxOffsetMilli=0: 0 + 8.0 < 15.99 ✓
+static_assert(MaxOffsetMilli * 1e-3f + RescaleThreshold < 15.99f,
+    "max_offset + rescale_threshold must stay below log2(fp16_max) to avoid P saturation");
+```
+
+This is a compile-time safety check; no runtime cost.
+
+### 14.4 B-1: pack the `add_round_down` (affects §5.4, §7.4)
+
+**Status:** Planned (refinement to existing B-1 design).
+
+The original B-1 design uses scalar `__float2int_rd(y)` for range reduction. FA4's `ex2_emulation_2` (in `utils.py`, line ~773) now uses:
+
+```python
+xy_rounded = cute.arch.add_packed_f32x2(xy_clamped, (fp32_round_int, fp32_round_int), rnd="rm")
+xy_rounded_back = quack.activation.sub_packed_f32x2(xy_rounded, (fp32_round_int, fp32_round_int))
+xy_frac = quack.activation.sub_packed_f32x2(xy_clamped, xy_rounded_back)
+```
+
+This means the round-down add, the subtract-back, and the fractional extraction are all packed on sm_100+.
+
+**Change to the plan:** The `exp2f_emu_x2` function in §7.4 is revised to use packed operations throughout:
+
+```cpp
+__forceinline__ __device__ void exp2f_emu_x2(float &d0, float &d1, float y0, float y1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && !defined(UNFUSE_FMA)
+    // Clamp to >= -127.0
+    y0 = fmaxf(y0, -127.0f);
+    y1 = fmaxf(y1, -127.0f);
+
+    // Packed round-down add: x_rounded = add.rm.ftz.f32x2(y, magic)
+    constexpr float magic = float(1 << 23 | 1 << 22);
+    float r0, r1;
+    asm("{\n\t"
+        ".reg .b64 rl, ml, rb;\n\t"
+        "mov.b64 ml, {%4, %5};\n\t"
+        "mov.b64 rl, {%2, %3};\n\t"
+        "add.rm.ftz.f32x2 rb, rl, ml;\n\t"
+        "mov.b64 {%0, %1}, rb;\n\t"
+        "}\n"
+        : "=f"(r0), "=f"(r1)
+        : "f"(y0), "f"(y1), "f"(magic), "f"(magic));
+
+    // Packed subtract-back: x_rounded_back = r - magic
+    float rb0, rb1;
+    fma_f32x2(rb0, rb1, r0, r1, 1.0f, 1.0f, -magic, -magic);
+
+    // Packed fractional: frac = y - x_rounded_back
+    float f0, f1;
+    fma_f32x2(f0, f1, rb0, rb1, -1.0f, -1.0f, y0, y1);
+
+    // Horner with packed FMA (3 FMAs, degree 3)
+    float p0 = kPolyEx2[3], p1 = kPolyEx2[3];
+    fma_f32x2(p0, p1, p0, p1, f0, f1, kPolyEx2[2], kPolyEx2[2]);
+    fma_f32x2(p0, p1, p0, p1, f0, f1, kPolyEx2[1], kPolyEx2[1]);
+    fma_f32x2(p0, p1, p0, p1, f0, f1, kPolyEx2[0], kPolyEx2[0]);
+
+    // Reconstruct: 2^k * p via bit manipulation
+    int k0 = __float_as_int(r0);
+    int k1 = __float_as_int(r1);
+    int b0 = __float_as_int(p0) + (k0 << 23);
+    int b1 = __float_as_int(p1) + (k1 << 23);
+    d0 = __int_as_float(b0);
+    d1 = __int_as_float(b1);
+#else
+    d0 = exp2f_emu(y0);
+    d1 = exp2f_emu(y1);
+#endif
+}
+```
+
+**Note:** The exact register-level reconstruction (`combine_int_frac_ex2` in FA4) uses `shl.b32` + `add.s32` to combine the integer exponent with the polynomial result. The C++ port above approximates this with `__float_as_int` + integer shift. The SASS gate must verify that the generated code does not contain scalar `MUFU.EX2` inside `exp2f_emu_x2` on sm_120.
+
+### 14.5 B-2: updated tuning defaults and fragment-boundary logic (affects §5.5, §7.5)
+
+**Status:** Planned (supersedes original B-2 defaults and dispatch logic).
+
+#### 14.5.1 Updated tuning table
+
+FA4's `_TUNING_CONFIG` in `flash_fwd_sm100.py` (as of commit `849f660`) now has per-(causal, varlen, hdim, pack_gqa) entries:
+
+| hdim | causal | varlen | freq | start_frg | res |
+|---|---|---|---|---|---|
+| 128 | yes | no | 10 | 1 | 4 (default) |
+| 128 | no | yes | 16 | 1 | 4 |
+| 192 | yes | no | 16 | 0 | 4 |
+| 192 | no | yes | 32 | 1 | 4 |
+| 256 | yes/no | no | 14 | 0 | **6** |
+| 128/192 | any | yes (pack_gqa) | 0 (all HW) | 0 | — |
+
+The original plan's `(4, 3, 0)` and `(2, 1, 0)` are superseded. The new defaults should be used directly as the initial FA2 tuning values, with the caveat that FA2's tile layout differs from FA4's and may require re-measurement.
+
+**Change to §7.5:** Replace the "Recommended initial defaults" section with the table above. Add a note that `ex2_emu_res` is only used for hdim=256 in FA4; other hdim values use the default `res=4`.
+
+#### 14.5.2 Fragment-boundary-aware mixed mode
+
+FA4's `apply_exp2_convert` (in `softmax.py`, lines ~360–400) uses a more complex dispatch than the plan's `k % freq != res`:
+
+```python
+if k % ex2_emu_freq < ex2_emu_freq - ex2_emu_res:
+    # Hardware MUFU.EX2
+elif j >= frg_cnt - 1:
+    # Hardware MUFU.EX2 (last fragment)
+elif j < ex2_emu_start_frg:
+    # Hardware MUFU.EX2 (before start fragment)
+else:
+    # Polynomial emulation
+```
+
+The fragment-boundary conditions ensure that the first and last fragments always use hardware `MUFU.EX2`, which provides accuracy anchoring at the tile edges where boundary effects are most pronounced.
+
+**Change to §7.5:** The mixed-mode dispatch in `scale_apply_exp2` is revised to:
+
+```cpp
+// FA2 does not have "fragments" in the CuTeDSL sense, but we can
+// partition the N1 inner loop into frg_tile=32 chunks to mirror FA4.
+constexpr int frg_tile = 32;
+constexpr int frg_cnt = N1 / frg_tile;  // assumed N1 % frg_tile == 0
+
+for (int j = 0; j < frg_cnt; ++j) {
+    for (int k = 0; k < frg_tile; k += 2) {
+        int idx = j * frg_tile + k;
+        bool use_hw = false;
+        if constexpr (Ex2EmuFreq == 0) {
+            use_hw = true;  // all hardware
+        } else {
+            if (k % Ex2EmuFreq < Ex2EmuFreq - Ex2EmuRes) use_hw = true;
+            if (j >= frg_cnt - 1) use_hw = true;       // last fragment
+            if (j < Ex2EmuStartFrg) use_hw = true;      // before start fragment
+        }
+        if (use_hw) {
+            tensor(mi, idx)     = exp2f(tensor(mi, idx));
+            tensor(mi, idx + 1) = exp2f(tensor(mi, idx + 1));
+        } else {
+            exp2f_emu_x2(tensor(mi, idx), tensor(mi, idx + 1),
+                         tensor(mi, idx), tensor(mi, idx + 1));
+        }
+    }
+}
+```
+
+### 14.6 `POLY_EX2` degree 0–5 support (affects §7.4)
+
+**Status:** Planned (additive to existing B-1).
+
+FA4's `utils.py::POLY_EX2` now provides coefficients for degrees 0 through 5 (the original plan only referenced degree 3). The higher degrees provide tighter accuracy at the cost of more FMAs:
+
+| Degree | FMAs (scalar) | FMAs (packed) | Abs error on [0,1) |
+|---|---|---|---|
+| 3 | 3 | 3 (via `fma_f32x2`) | ~2e-5 |
+| 4 | 4 | 4 | ~5e-6 |
+| 5 | 5 | 5 | ~1e-6 |
+
+**Change to B-1:** The `kPolyEx2` constant array in `softmax.h` is parameterized by a `PolyDegree` template parameter (default 3). A `static_assert` ensures `PolyDegree >= 1 && PolyDegree <= 5`. The degree-4 and degree-5 coefficients are copied verbatim from FA4's `POLY_EX2` dict.
+
+This provides a precision fallback: if B-1 with degree 3 fails the logits cosine >= 0.9995 threshold on some workload, bumping to degree 4 is a one-line template parameter change.
+
+### 14.7 Updated phase table (supersedes §6)
+
+| Phase | Plans | Gating criterion to enter | Gating criterion to exit |
+|---|---|---|---|
+| 0 | Measurement scaffolding | None | `bench/fa2_baseline.py` committed; baseline JSON recorded for hdim ∈ {64,128,256}, seqlen ∈ {1k,4k,8k,16k}, dtype ∈ {fp16,bf16} on sm_120. `bench/check_sass_gates.py` committed and passing. |
+| 1 | A-1 (revised), A-2, A-4 (new) | Phase 0 baseline recorded | sm_80 numeric regression ≤ 1%; sm_120 improvement in any cell. **SASS gates:** `FFMA.X2` in `scale_apply_exp2` (A-2); packed max/add in reduction symbols (A-4). |
+| 2 | A-3, B-1 (revised), B-2 (revised) | Phase 1 merged and SASS gates satisfied | A-3 byte-identical at default + assert passes. B-1 sm_120 improvement with per-element softmax relative error ≤ 5e-5 and logits cosine ≥ 0.9995. B-2 defaults documented and benchmarked per hdim. **SASS gate:** `FFMA.X2` in `exp2f_emu_x2`, no `MUFU.EX2` in emulated lanes on sm_120. |
+| 3 | C-1 | Phase 2 merged | hdim-bucketed retune yields ≥ 5% on sm_120 for any (hdim, seqlen) cell with no regression on sm_80 and no regression on GQA group=8. |
+
+### 14.8 Updated sequencing constraints (supersedes §6.1)
+
+- A-2 must land before A-3 / B-1 / B-2 / A-4 (all depend on `fma_f32x2`).
+- A-4 can land in parallel with A-1 revision (they touch different parts of `softmax.h`).
+- A-3 lands before B-1 (polynomial domain bounding).
+- B-1 lands before B-2 (mixed mode reuses the polynomial).
+- C-1 is independent; sequenced last to avoid conflict with B-* changes in `kernel_traits.h`.
+- The A-1 threshold revision (§14.1) can land independently of A-4, but both should be in Phase 1.
+
+### 14.9 Updated risk register (additions to §9)
+
+| ID | Risk | Likelihood | Impact | Mitigation |
+|---|---|---|---|---|
+| R13 | A-1 revised threshold (8.0) causes accuracy regression on a workload FA4 did not test | Medium | Functional regression | Revert to a smaller threshold (e.g. 4.0) via the float template parameter. The old 0.01 value is still available as a fallback. Phase 0 baseline provides the comparison point. |
+| R14 | A-4 packed reduction produces different accumulation order than scalar, causing bit-level divergence from A-1-on-only builds | Low | Numeric noise | Packed FMA is round-to-nearest-even, same as scalar `fmaf`. The divergence is ULP-level, within existing accuracy budgets. |
+| R15 | B-1 packed `add.rm.ftz.f32x2` is not supported by the nvcc version in use | Low | Build break on sm_100+ | The `__CUDA_ARCH__` guard ensures it is only emitted for sm_100+. CUDA 13.0 ptxas supports `add.rm.ftz.f32x2` for `.target sm_100`. |
+| R16 | B-2 fragment-boundary logic assumes `N1 % 32 == 0`; a future MMA atom may violate this | Low | Compile error | Add `static_assert(N1 % frg_tile == 0)` at the entry of the mixed-mode path. |
+| R17 | FA4 tuning table values are optimal for B200 (sm_100 datacenter) but suboptimal for sm_120 consumer | Medium | B-2 defaults underperform on RTX 5060 Ti | Treat FA4 values as starting points; Phase 2 measurement on sm_120 may override. Record both FA4-reference and sm_120-measured values in the commit. |
+
+### 14.10 Updated references (additions to §12)
+
+- `flash_attn/cute/softmax.py` — `SoftmaxSm100` class with `rescale_threshold: float`, `max_offset: int`, `apply_exp2_convert` with fragment-boundary-aware mixed mode (current as of commit `849f660`).
+- `flash_attn/cute/utils.py` — `POLY_EX2` dict (degrees 0–5), `ex2_emulation_2` with `add_packed_f32x2(rnd="rm")`, `evaluate_polynomial_2` with `fma_packed_f32x2`, `fmax_reduce`/`fadd_reduce` with sm_100+ packed paths.
+- `flash_attn/cute/flash_fwd_sm100.py` — `_TUNING_CONFIG` and `_FP8_TUNING_CONFIG` tables with per-(hdim, causal, varlen, pack_gqa) `ex2_emu_freq`/`ex2_emu_res`/`ex2_emu_start_frg` values. `_LOG2_DTYPE_MAX` table and `max_offset + rescale_threshold` assert.
+- Commit `2409214` — `[CuTe, SM100] Fix FP8 e4m3 accuracy: make max_offset dtype-aware` (#2717). Later partially reverted by `849f660`.
+- Commit `849f660` — `Numeric tweaks to fp8` (#2731). Reverted e4m3-specific `max_offset=4` cap; introduced `rescale_threshold=0.0` for fp8 + assert pattern; added `_LOG2_DTYPE_MAX` table.
+- Commit `00756db` — `Expand FLASHATTENTION_DISABLE_DROPOUT to not bring in unneeded headers` (#2669). Removed transitive `M_LOG2E` definition on Windows; caused the `M_LOG2E` build fix in the fork's `softmax.h` and `setup.py`.
+
+### 14.11 Summary of changes to existing plan sections
+
+| Section | Change |
+|---|---|
+| §5.1 (A-1) | Threshold design superseded by §14.1: `float RescaleThreshold` replaces `bool Use_rescale_threshold`; default `8.0` replaces `0.01`. |
+| §5.3 (A-3) | Add `max_offset + rescale_threshold < log2(dtype_max)` static_assert per §14.3. |
+| §5.4 (B-1) | `exp2f_emu_x2` revised to use packed `add.rm.ftz.f32x2` per §14.4. `POLY_EX2` degree parameterized per §14.6. |
+| §5.5 (B-2) | Defaults updated to FA4 tuning table per §14.5.1. Dispatch logic updated to fragment-boundary-aware per §14.5.2. |
+| §5 (new) | New plan A-4 added per §14.2. |
+| §6 | Phase table superseded by §14.7. Sequencing constraints superseded by §14.8. |
+| §7.1 (A-1 detail) | Revised to use float threshold parameter. |
+| §7.4 (B-1 detail) | `exp2f_emu_x2` implementation revised per §14.4. |
+| §7.5 (B-2 detail) | Defaults and dispatch logic revised per §14.5. |
+| §8.1 (Accuracy) | A-1 acceptance threshold widened per §14.1. |
+| §8.2 (Performance) | A-4 SASS gate added. |
+| §9 (Risks) | R13–R17 added per §14.9. |
+| §11.4 (Pending) | A-1 threshold revision, A-4, B-1 packed round-down, B-2 updated defaults, POLY_EX2 degree parameterization added to pending list. |
+| §12 (References) | New references added per §14.10. |
+
+## 15. Implementation Code Edit Guide (2026-08-11)
+
+This section provides concrete, file-by-file edit instructions for each plan item in §14. Every edit is described with: target file, exact location (line numbers as of the working tree at commit `3b44820` + uncommitted `M_LOG2E` fix), before/after code, and build verification steps.
+
+The edits are ordered by recommended implementation sequence (Phase 1 first, then Phase 2).
+
+---
+
+### 15.1 A-1 threshold revision (§14.1)
+
+**Files affected:**
+1. `csrc/flash_attn/src/softmax.h` — template parameter + skip logic
+2. `csrc/flash_attn/src/flash_fwd_kernel.h` — 4 call sites
+
+#### Edit 1: `softmax.h` — replace bool parameter with float
+
+**Location:** `softmax.h` lines ~143–145 (the `softmax_rescale_o` template signature) and lines ~120–125 (the `kSoftmaxRescaleSkipThreshold` constant).
+
+**Before (current):**
+```cpp
+// Line ~120
+inline constexpr float kSoftmaxRescaleSkipThreshold = -0.01f;
+
+// Line ~143
+template<bool Is_first, bool Check_inf=false, bool Use_rescale_threshold=false, typename Tensor0, typename Tensor1>
+__forceinline__ __device__ void softmax_rescale_o(Tensor0 &acc_s, Tensor1 &acc_o, float softmax_scale_log2) {
+    static_assert(!(Is_first && Use_rescale_threshold),
+                  "Use_rescale_threshold has no effect when Is_first=true; "
+                  "remove the flag from the Is_first=true call site.");
+```
+
+**After:**
+```cpp
+// Line ~120 — DELETE the kSoftmaxRescaleSkipThreshold constant entirely.
+// The threshold is now a template parameter, not a file-scope constant.
+
+// Line ~143
+template<bool Is_first, bool Check_inf=false, float RescaleThreshold=0.0f, typename Tensor0, typename Tensor1>
+__forceinline__ __device__ void softmax_rescale_o(Tensor0 &acc_s, Tensor1 &acc_o, float softmax_scale_log2) {
+    static_assert(!(Is_first && RescaleThreshold > 0.0f),
+                  "RescaleThreshold > 0 has no effect when Is_first=true; "
+                  "remove the threshold from the Is_first=true call site.");
+```
+
+#### Edit 2: `softmax.h` — replace skip condition
+
+**Location:** `softmax.h` lines ~175–177 (the `if constexpr` skip block inside `softmax_rescale_o`).
+
+**Before:**
+```cpp
+                if constexpr (Use_rescale_threshold) {
+                    if (scaled_diff >= kSoftmaxRescaleSkipThreshold) { continue; }
+                }
+```
+
+**After:**
+```cpp
+                if constexpr (RescaleThreshold > 0.0f) {
+                    if (scaled_diff >= -RescaleThreshold) { continue; }
+                }
+```
+
+Note: `scaled_diff` is already computed as `(scores_max_prev - scores_max_cur) * softmax_scale_log2` which is ≤ 0 in normal flow. `-RescaleThreshold` means "skip if the rescale factor is within `exp2(-RescaleThreshold)` of 1.0". With `RescaleThreshold=8.0f`, that's `exp2(-8.0) ≈ 0.0039`.
+
+#### Edit 3: `flash_fwd_kernel.h` — update 4 call sites
+
+**Location:** `flash_fwd_kernel.h` lines ~351, ~414, ~925, ~992.
+
+**Before (all 4 sites, same pattern):**
+```cpp
+softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/..., /*Use_rescale_threshold=*/true>(acc_s, acc_o, params.scale_softmax_log2);
+```
+
+**After:**
+```cpp
+softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/..., /*RescaleThreshold=*/8.0f>(acc_s, acc_o, params.scale_softmax_log2);
+```
+
+Replace `/*Use_rescale_threshold=*/true` with `/*RescaleThreshold=*/8.0f` at each of the 4 call sites. Leave the `Is_first=true` call sites (lines ~350, ~924) unchanged — they don't pass the threshold parameter (it defaults to `0.0f`).
+
+#### Verification
+
+```powershell
+cd D:\USERFILES\GitHub\flash-attention
+# Build (Windows)
+.\WindowsWhlBuilder_cuda.bat
+# Quick smoke test
+python -c "import torch; from flash_attn import flash_attn_func; q=torch.randn(1,512,8,128,dtype=torch.float16,device='cuda'); k=torch.randn_like(q); v=torch.randn_like(q); o=flash_attn_func(q,k,v,causal=True); print('OK', o.shape, o.dtype)"
+# Compare output against pre-change build for numeric divergence
+# (save reference output before rebuilding)
+```
+
+---
+
+### 15.2 A-4: packed `fmax_reduce` / `fadd_reduce` (§14.2)
+
+**Files affected:**
+1. `csrc/flash_attn/src/utils.h` — new `fmax_3way` helper
+2. `csrc/flash_attn/src/softmax.h` — `thread_reduce_` packed path
+
+#### Edit 1: `utils.h` — add `fmax_3way` helper
+
+**Location:** `utils.h`, after the `fma_f32x2` function (before the closing `}` of `namespace FLASH_NAMESPACE`, currently line ~457).
+
+**Add:**
+```cpp
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// 3-way max helper (Plan A-4): returns max(a, b, c).
+// On all arches this is two dependent max instructions; the benefit on sm_100+
+// comes from the reduction loop unrolling pattern (8-wide instead of 2-wide),
+// which gives the scheduler more instructions to overlap.
+// FA4 uses the same pattern via cute.arch.fmax(a, b, c).
+__forceinline__ __device__ float fmax_3way(float a, float b, float c) {
+    float result;
+    asm("max.f32 %0, %1, %2;\n\t"
+        "max.f32 %0, %0, %3;\n\t"
+        : "=f"(result) : "f"(a), "f"(b), "f"(c));
+    return result;
+}
+```
+
+Note: Unlike `fma_f32x2`, this helper does NOT need an `__CUDA_ARCH__` guard because `max.f32` is valid on all arches. The optimization is in the loop structure, not the instruction.
+
+#### Edit 2: `softmax.h` — add packed `thread_reduce_` specialization
+
+**Location:** `softmax.h`, after the existing `thread_reduce_` function (currently ends at line ~44), before `quad_allreduce_`.
+
+**Add a new overload:**
+```cpp
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Plan A-4: packed thread_reduce_ for sm_100+
+// On sm_100+, process 8 columns at a time for max (4 accumulator lanes,
+// 2 columns per lane via fmax_3way) and 2 columns at a time for sum
+// (via fma_f32x2-based packed add).
+// The original thread_reduce_ above is retained for sm_80/86/89/90 (unchanged binary).
+
+template<bool zero_init=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
+__device__ __forceinline__ void thread_reduce_max_packed(
+    Tensor<Engine0, Layout0> const &tensor,
+    Tensor<Engine1, Layout1> &summary) {
+    static_assert(Layout0::rank == 2, "Only support 2D Tensor");
+    static_assert(Layout1::rank == 1, "Only support 1D Tensor");
+    CUTE_STATIC_ASSERT_V(size<0>(summary) == size<0>(tensor));
+    constexpr int N1 = decltype(size<1>(tensor))::value;
+    #pragma unroll
+    for (int mi = 0; mi < size<0>(tensor); mi++) {
+        if constexpr (N1 >= 8) {
+            // 8-wide reduction: 4 accumulators, 2 columns per step
+            float m0 = zero_init ? tensor(mi, 0) : summary(mi);
+            float m1 = zero_init ? tensor(mi, 1) : summary(mi);
+            float m2 = zero_init ? tensor(mi, 2) : summary(mi);
+            float m3 = zero_init ? tensor(mi, 3) : summary(mi);
+            #pragma unroll
+            for (int ni = 4; ni < N1; ni += 4) {
+                m0 = fmaxf(m0, tensor(mi, ni));
+                m1 = fmaxf(m1, tensor(mi, ni + 1));
+                m2 = fmaxf(m2, tensor(mi, ni + 2));
+                m3 = fmaxf(m3, tensor(mi, ni + 3));
+            }
+            // Collapse 4 → 1 via fmax_3way
+            summary(mi) = fmax_3way(m0, m1, fmaxf(m2, m3));
+        } else {
+            // Fallback to original scalar path for small N1
+            summary(mi) = zero_init ? tensor(mi, 0) : fmaxf(summary(mi), tensor(mi, 0));
+            #pragma unroll
+            for (int ni = 1; ni < N1; ni++) {
+                summary(mi) = fmaxf(summary(mi), tensor(mi, ni));
+            }
+        }
+    }
+}
+
+template<bool zero_init=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
+__device__ __forceinline__ void thread_reduce_sum_packed(
+    Tensor<Engine0, Layout0> const &tensor,
+    Tensor<Engine1, Layout1> &summary) {
+    static_assert(Layout0::rank == 2, "Only support 2D Tensor");
+    static_assert(Layout1::rank == 1, "Only support 1D Tensor");
+    CUTE_STATIC_ASSERT_V(size<0>(summary) == size<0>(tensor));
+    constexpr int N1 = decltype(size<1>(tensor))::value;
+    static_assert(N1 % 2 == 0, "thread_reduce_sum_packed requires even N1");
+    #pragma unroll
+    for (int mi = 0; mi < size<0>(tensor); mi++) {
+        if constexpr (N1 >= 8) {
+            // 4 accumulator pairs, each holding 2 lanes
+            float s0a, s0b, s1a, s1b, s2a, s2b, s3a, s3b;
+            if constexpr (zero_init) {
+                s0a = tensor(mi, 0); s0b = tensor(mi, 1);
+                s1a = tensor(mi, 2); s1b = tensor(mi, 3);
+                s2a = tensor(mi, 4); s2b = tensor(mi, 5);
+                s3a = tensor(mi, 6); s3b = tensor(mi, 7);
+            } else {
+                // Initialize from summary, packed with first elements
+                fma_f32x2(s0a, s0b, 1.0f, 1.0f, summary(mi), summary(mi), tensor(mi, 0), tensor(mi, 1));
+                fma_f32x2(s1a, s1b, 1.0f, 1.0f, summary(mi), summary(mi), tensor(mi, 2), tensor(mi, 3));
+                fma_f32x2(s2a, s2b, 1.0f, 1.0f, summary(mi), summary(mi), tensor(mi, 4), tensor(mi, 5));
+                fma_f32x2(s3a, s3b, 1.0f, 1.0f, summary(mi), summary(mi), tensor(mi, 6), tensor(mi, 7));
+            }
+            #pragma unroll
+            for (int ni = 8; ni < N1; ni += 8) {
+                // Packed add: (s0a, s0b) += (tensor[ni], tensor[ni+1])
+                fma_f32x2(s0a, s0b, 1.0f, 1.0f, s0a, s0b, tensor(mi, ni), tensor(mi, ni + 1));
+                fma_f32x2(s1a, s1b, 1.0f, 1.0f, s1a, s1b, tensor(mi, ni + 2), tensor(mi, ni + 3));
+                fma_f32x2(s2a, s2b, 1.0f, 1.0f, s2a, s2b, tensor(mi, ni + 4), tensor(mi, ni + 5));
+                fma_f32x2(s3a, s3b, 1.0f, 1.0f, s3a, s3b, tensor(mi, ni + 6), tensor(mi, ni + 7));
+            }
+            // Collapse 4 pairs → 1 scalar
+            fma_f32x2(s0a, s0b, 1.0f, 1.0f, s0a, s0b, s1a, s1b);
+            fma_f32x2(s2a, s2b, 1.0f, 1.0f, s2a, s2b, s3a, s3b);
+            fma_f32x2(s0a, s0b, 1.0f, 1.0f, s0a, s0b, s2a, s2b);
+            summary(mi) = s0a + s0b;
+        } else {
+            // Fallback for small N1
+            summary(mi) = zero_init ? tensor(mi, 0) : summary(mi) + tensor(mi, 0);
+            #pragma unroll
+            for (int ni = 1; ni < N1; ni++) {
+                summary(mi) = summary(mi) + tensor(mi, ni);
+            }
+        }
+    }
+}
+```
+
+#### Edit 3: `softmax.h` — dispatch to packed paths in `reduce_max` / `reduce_sum`
+
+**Location:** `softmax.h` lines ~61–69 (the `reduce_max` and `reduce_sum` functions).
+
+**Before:**
+```cpp
+template<bool zero_init=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
+__device__ __forceinline__ void reduce_max(Tensor<Engine0, Layout0> const& tensor, Tensor<Engine1, Layout1> &max){
+    MaxOp<float> max_op;
+    reduce_<zero_init>(tensor, max, max_op);
+}
+
+template<bool zero_init=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
+__device__ __forceinline__ void reduce_sum(Tensor<Engine0, Layout0> const& tensor, Tensor<Engine1, Layout1> &sum){
+    SumOp<float> sum_op;
+    thread_reduce_<zero_init>(tensor, sum, sum_op);
+}
+```
+
+**After:**
+```cpp
+template<bool zero_init=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
+__device__ __forceinline__ void reduce_max(Tensor<Engine0, Layout0> const& tensor, Tensor<Engine1, Layout1> &max){
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && !defined(UNFUSE_FMA)
+    thread_reduce_max_packed<zero_init>(tensor, max);
+#else
+    MaxOp<float> max_op;
+    reduce_<zero_init>(tensor, max, max_op);
+#endif
+    // quad_allreduce is still needed for cross-warp reduction
+    MaxOp<float> max_op;
+    quad_allreduce_(max, max, max_op);
+}
+
+template<bool zero_init=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
+__device__ __forceinline__ void reduce_sum(Tensor<Engine0, Layout0> const& tensor, Tensor<Engine1, Layout1> &sum){
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && !defined(UNFUSE_FMA)
+    thread_reduce_sum_packed<zero_init>(tensor, sum);
+#else
+    SumOp<float> sum_op;
+    thread_reduce_<zero_init>(tensor, sum, sum_op);
+#endif
+}
+```
+
+Note: `reduce_max` calls `reduce_` which does `thread_reduce_` + `quad_allreduce_`. The packed version splits these: `thread_reduce_max_packed` replaces the `thread_reduce_` part; `quad_allreduce_` stays the same (it operates on the 1D `summary` tensor, unchanged).
+
+For `reduce_sum`: the original only calls `thread_reduce_` (no `quad_allreduce_`), so the packed replacement is self-contained.
+
+#### Verification
+
+```powershell
+# After build, SASS check for A-4:
+# Look for increased FMAX and FFMA.X2 in the softmax reduction symbols
+cuobjdump --dump-sass flash_attn_lib.so | Select-String "FMAX|FFMA.X2" | Measure-Object
+# Compare count against pre-A-4 build — should see more packed instructions
+```
+
+---
+
+### 15.3 A-3: `max_offset + rescale_threshold` assert (§14.3)
+
+**Files affected:**
+1. `csrc/flash_attn/src/softmax.h` — add `static_assert` in `softmax_rescale_o`
+
+#### Edit 1: `softmax.h` — add assert after template signature
+
+**Location:** `softmax.h`, immediately after the `static_assert(!(Is_first && RescaleThreshold > 0.0f))` line (added in §15.1).
+
+**Add:**
+```cpp
+    // Safety: max_offset + rescale_threshold must stay below log2(dtype_max) to avoid P saturation.
+    // For fp16: log2(65504) ≈ 15.99. For bf16: log2(3.39e38) ≈ 128.0.
+    // Currently MaxOffsetMilli=0 (no fp8 path), RescaleThreshold=8.0 at most.
+    // This assert will catch a future fp8 path that sets both without checking the bound.
+    static_assert(
+        true,  // MaxOffsetMilli is not yet a template parameter; placeholder.
+               // When A-3's MaxOffsetMilli is added, replace with:
+               // MaxOffsetMilli * 1e-3f + RescaleThreshold < 15.99f
+        "max_offset + rescale_threshold must stay below log2(fp16_max) to avoid P saturation");
+```
+
+Note: This is a placeholder. The real assert activates when A-3's `MaxOffsetMilli` template parameter is added (Phase 2). For now it documents the invariant.
+
+---
+
+### 15.4 B-1: `exp2` polynomial emulation with packed round-down (§14.4)
+
+**Files affected:**
+1. `csrc/flash_attn/src/utils.h` — `POLY_EX2` coefficients, `exp2f_emu`, `exp2f_emu_x2`
+2. `csrc/flash_attn/src/softmax.h` — `scale_apply_exp2` template parameter + dispatch
+
+#### Edit 1: `utils.h` — add `POLY_EX2` coefficients and emulation functions
+
+**Location:** `utils.h`, after the `fmax_3way` helper (added in §15.2), before the closing `}` of `namespace FLASH_NAMESPACE`.
+
+**Add:**
+```cpp
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Plan B-1: exp2 polynomial emulation (Sollya minimax)
+// Coefficients copied verbatim from flash_attn/cute/utils.py::POLY_EX2
+// Degree 3 is the default; degrees 0-5 are available for precision tuning.
+
+namespace detail {
+// fpminimax(exp(x * log(2.0)), deg, [|1,24...|],[0;1],relative)
+template<int Deg> struct PolyEx2;
+template<> struct PolyEx2<0>  { static constexpr float c[1] = {1.0f}; static constexpr int size = 1; };
+template<> struct PolyEx2<1>  { static constexpr float c[2] = {1.0f, 0.922497093677520751953125f}; static constexpr int size = 2; };
+template<> struct PolyEx2<2>  { static constexpr float c[3] = {1.0f, 0.6657850742340087890625f, 0.330107033252716064453125f}; static constexpr int size = 3; };
+template<> struct PolyEx2<3>  { static constexpr float c[4] = {1.0f, 0.695146143436431884765625f, 0.227564394474029541015625f, 0.077119089663028717041015625f}; static constexpr int size = 4; };
+template<> struct PolyEx2<4>  { static constexpr float c[5] = {1.0f, 0.693042695522308349609375f, 0.2412912547588348388671875f, 5.2225358784198760986328125e-2f, 1.3434938155114650726318359375e-2f}; static constexpr int size = 5; };
+template<> struct PolyEx2<5>  { static constexpr float c[6] = {1.0f, 0.693151414394378662109375f, 0.24016360938549041748046875f, 5.5802188813686370849609375e-2f, 9.01452265679836273193359375e-3f, 1.86810153536498546600341796875e-3f}; static constexpr int size = 6; };
+}  // namespace detail
+
+// Scalar exp2 emulation using Sollya minimax polynomial.
+// Matches flash_attn/cute/utils.py::ex2_emulation (degree 3 default).
+template<int PolyDegree = 3>
+__forceinline__ __device__ float exp2f_emu(float x) {
+    constexpr auto& poly = detail::PolyEx2<PolyDegree>::c;
+    constexpr int deg = detail::PolyEx2<PolyDegree>::size - 1;
+    // Clamp to >= -127.0
+    x = fmaxf(x, -127.0f);
+    // Range reduction: x = k + f, k = floor(x), f in [0, 1)
+    // Using add.rm.ftz.f32 (round-down add) with magic bias
+    constexpr float magic = float(1 << 23 | 1 << 22);  // 2^23 + 2^22
+    float x_rounded;
+    asm("add.rm.ftz.f32 %0, %1, %2;\n\t" : "=f"(x_rounded) : "f"(x), "f"(magic));
+    float x_rounded_back = x_rounded - magic;
+    float frac = x - x_rounded_back;
+    // Horner evaluation
+    float p = poly[deg];
+    #pragma unroll
+    for (int i = deg - 1; i >= 0; i--) {
+        p = fmaf(p, frac, poly[i]);
+    }
+    // Reconstruct 2^k * p via exponent field manipulation
+    int k = __float_as_int(x_rounded);  // integer floor in low bits (magic-biased)
+    int bits = __float_as_int(p) + (k << 23);
+    return __int_as_float(bits);
+}
+
+// Packed exp2 emulation for sm_100+ (2 lanes at once).
+// Matches flash_attn/cute/utils.py::ex2_emulation_2 + e2e_asm2.
+template<int PolyDegree = 3>
+__forceinline__ __device__ void exp2f_emu_x2(float &d0, float &d1, float y0, float y1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && !defined(UNFUSE_FMA)
+    constexpr auto& poly = detail::PolyEx2<PolyDegree>::c;
+    constexpr int deg = detail::PolyEx2<PolyDegree>::size - 1;
+
+    // Clamp
+    y0 = fmaxf(y0, -127.0f);
+    y1 = fmaxf(y1, -127.0f);
+
+    // Packed round-down add: x_rounded = add.rm.ftz.f32x2(y, magic)
+    constexpr float magic = float(1 << 23 | 1 << 22);
+    float r0, r1;
+    asm("{\n\t"
+        ".reg .b64 rl, ml, rb;\n\t"
+        "mov.b64 ml, {%4, %5};\n\t"
+        "mov.b64 rl, {%2, %3};\n\t"
+        "add.rm.ftz.f32x2 rb, rl, ml;\n\t"
+        "mov.b64 {%0, %1}, rb;\n\t"
+        "}\n"
+        : "=f"(r0), "=f"(r1)
+        : "f"(y0), "f"(y1), "f"(magic), "f"(magic));
+
+    // Packed subtract-back: x_rounded_back = r - magic
+    float rb0, rb1;
+    fma_f32x2(rb0, rb1, r0, r1, 1.0f, 1.0f, -magic, -magic);
+
+    // Packed fractional: frac = y - x_rounded_back
+    float f0, f1;
+    fma_f32x2(f0, f1, rb0, rb1, -1.0f, -1.0f, y0, y1);
+
+    // Horner with packed FMA
+    float p0 = poly[deg], p1 = poly[deg];
+    #pragma unroll
+    for (int i = deg - 1; i >= 0; i--) {
+        fma_f32x2(p0, p1, p0, p1, f0, f1, poly[i], poly[i]);
+    }
+
+    // Reconstruct 2^k * p
+    int k0 = __float_as_int(r0);
+    int k1 = __float_as_int(r1);
+    int b0 = __float_as_int(p0) + (k0 << 23);
+    int b1 = __float_as_int(p1) + (k1 << 23);
+    d0 = __int_as_float(b0);
+    d1 = __int_as_float(b1);
+#else
+    d0 = exp2f_emu<PolyDegree>(y0);
+    d1 = exp2f_emu<PolyDegree>(y1);
+#endif
+}
+```
+
+#### Edit 2: `softmax.h` — add `Use_exp2_emu` and `PolyDegree` to `scale_apply_exp2`
+
+**Location:** `softmax.h`, the `scale_apply_exp2` function (currently lines ~83–116).
+
+**Before (current signature):**
+```cpp
+template <bool Scale_max=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
+__forceinline__ __device__ void scale_apply_exp2(Tensor<Engine0, Layout0> &tensor, Tensor<Engine1, Layout1> const &max, const float scale) {
+```
+
+**After:**
+```cpp
+template <bool Scale_max=true, bool Use_exp2_emu=false, int PolyDegree=3, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
+__forceinline__ __device__ void scale_apply_exp2(Tensor<Engine0, Layout0> &tensor, Tensor<Engine1, Layout1> const &max, const float scale) {
+```
+
+**In the sm_100+ branch** (currently lines ~96–110), replace the `exp2f(r0)` / `exp2f(r1)` calls:
+
+**Before:**
+```cpp
+            tensor(mi, ni)     = exp2f(r0);
+            tensor(mi, ni + 1) = exp2f(r1);
+```
+
+**After:**
+```cpp
+            if constexpr (Use_exp2_emu) {
+                exp2f_emu_x2<PolyDegree>(tensor(mi, ni), tensor(mi, ni + 1), r0, r1);
+            } else {
+                tensor(mi, ni)     = exp2f(r0);
+                tensor(mi, ni + 1) = exp2f(r1);
+            }
+```
+
+**In the scalar branch** (the `#else` path, lines ~111–116), add the same conditional:
+
+**Before:**
+```cpp
+            tensor(mi, ni) = exp2f(tensor(mi, ni) * scale - max_scaled);
+```
+
+**After:**
+```cpp
+            if constexpr (Use_exp2_emu) {
+                tensor(mi, ni) = exp2f_emu<PolyDegree>(tensor(mi, ni) * scale - max_scaled);
+            } else {
+                tensor(mi, ni) = exp2f(tensor(mi, ni) * scale - max_scaled);
+            }
+```
+
+#### Edit 3: Call sites — no changes needed yet
+
+The default `Use_exp2_emu=false` means all existing call sites (`softmax_rescale_o` in `softmax.h`, `flash_bwd_kernel.h:536`) remain unchanged. B-1 is enabled by explicitly passing `Use_exp2_emu=true` at the call site during Phase 2 tuning.
+
+---
+
+### 15.5 B-2: mixed mode with fragment-boundary logic (§14.5)
+
+**Files affected:**
+1. `csrc/flash_attn/src/softmax.h` — `scale_apply_exp2` gains `Ex2EmuFreq`, `Ex2EmuRes`, `Ex2EmuStartFrg` parameters
+
+This edit builds on top of §15.4 (B-1 must be applied first).
+
+#### Edit 1: `softmax.h` — extend `scale_apply_exp2` template
+
+**Location:** `softmax.h`, the `scale_apply_exp2` signature (modified in §15.4).
+
+**Before (after B-1 edit):**
+```cpp
+template <bool Scale_max=true, bool Use_exp2_emu=false, int PolyDegree=3, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
+```
+
+**After:**
+```cpp
+template <bool Scale_max=true, bool Use_exp2_emu=false, int PolyDegree=3,
+          int Ex2EmuFreq=0, int Ex2EmuRes=4, int Ex2EmuStartFrg=0,
+          typename Engine0, typename Layout0, typename Engine1, typename Layout1>
+```
+
+Default `Ex2EmuFreq=0` means "all hardware exp2" (= B-1's `Use_exp2_emu=false`). `Ex2EmuFreq > 0` activates mixed mode. `Use_exp2_emu=true` with `Ex2EmuFreq=0` means "all polynomial" (= B-1 full emulation).
+
+#### Edit 2: `softmax.h` — mixed-mode dispatch in the sm_100+ branch
+
+**Location:** The sm_100+ inner loop of `scale_apply_exp2` (modified in §15.4).
+
+**Replace the inner loop body with:**
+```cpp
+        // B-2 mixed mode: partition N1 into frg_tile=32 chunks
+        constexpr int frg_tile = 32;
+        constexpr int frg_cnt = N1 / frg_tile;
+        static_assert(N1 % frg_tile == 0,
+                      "B-2 mixed mode requires N1 % 32 == 0; "
+                      "fall back to Use_exp2_emu=false or Ex2EmuFreq=0 if violated.");
+        #pragma unroll
+        for (int j = 0; j < frg_cnt; ++j) {
+            #pragma unroll
+            for (int k = 0; k < frg_tile; k += 2) {
+                int ni = j * frg_tile + k;
+                float t0 = tensor(mi, ni);
+                float t1 = tensor(mi, ni + 1);
+                float r0, r1;
+                fma_f32x2(r0, r1, t0, t1, scale, scale, neg_max_scaled, neg_max_scaled);
+
+                // Determine whether to use hardware MUFU.EX2 or polynomial emulation
+                bool use_hw;
+                if constexpr (!Use_exp2_emu || Ex2EmuFreq == 0) {
+                    use_hw = true;  // No emulation requested
+                } else {
+                    use_hw = false;
+                    // Hardware for: (a) lanes where k % freq < freq - res,
+                    // (b) last fragment, (c) before start fragment
+                    if (k % Ex2EmuFreq < Ex2EmuFreq - Ex2EmuRes) use_hw = true;
+                    if (j >= frg_cnt - 1) use_hw = true;
+                    if (j < Ex2EmuStartFrg) use_hw = true;
+                }
+
+                if (use_hw) {
+                    tensor(mi, ni)     = exp2f(r0);
+                    tensor(mi, ni + 1) = exp2f(r1);
+                } else {
+                    exp2f_emu_x2<PolyDegree>(tensor(mi, ni), tensor(mi, ni + 1), r0, r1);
+                }
+            }
+        }
+```
+
+#### Edit 3: Call sites — enable B-2 during Phase 2 tuning
+
+No call site changes are needed for the default build. When tuning, enable B-2 at specific call sites in `softmax_rescale_o` by passing the template parameters:
+
+```cpp
+// Example: enable B-2 mixed mode for hdim=128, causal
+FLASH_NAMESPACE::scale_apply_exp2</*Scale_max=*/true,
+                                   /*Use_exp2_emu=*/true,
+                                   /*PolyDegree=*/3,
+                                   /*Ex2EmuFreq=*/10,
+                                   /*Ex2EmuRes=*/4,
+                                   /*Ex2EmuStartFrg=*/1>(scores, row_max, softmax_scale_log2);
+```
+
+This requires passing the parameters through `softmax_rescale_o` to `scale_apply_exp2`, which means `softmax_rescale_o` itself gains the same template parameters. The propagation is mechanical:
+
+```cpp
+template<bool Is_first, bool Check_inf=false, float RescaleThreshold=0.0f,
+         bool Use_exp2_emu=false, int PolyDegree=3,
+         int Ex2EmuFreq=0, int Ex2EmuRes=4, int Ex2EmuStartFrg=0,
+         typename Tensor0, typename Tensor1>
+__forceinline__ __device__ void softmax_rescale_o(...) {
+    ...
+    FLASH_NAMESPACE::scale_apply_exp2</*Scale_max=*/true, Use_exp2_emu, PolyDegree,
+                                      Ex2EmuFreq, Ex2EmuRes, Ex2EmuStartFrg>(
+        scores, row_max, softmax_scale_log2);
+    ...
+}
+```
+
+And the call sites in `flash_fwd_kernel.h` pass the hdim-specific tuning values. This is the last step of Phase 2, after benchmarking confirms the optimal `(freq, res, start)` per hdim.
+
+---
+
+### 15.6 C-1: hdim-bucketed block-size retuning (§5.6)
+
+**Files affected:**
+1. `csrc/flash_attn/src/kernel_traits.h` — new `Flash_fwd_kernel_traits_blackwell` family
+2. `csrc/flash_attn/src/flash_fwd_launch_template.h` — dispatch to Blackwell traits
+
+#### Edit 1: `kernel_traits.h` — add Blackwell traits
+
+**Location:** `kernel_traits.h`, after the existing `Flash_fwd_kernel_traits` and `Flash_fwd_kernel_traits_with_8_warps` definitions.
+
+**Add:**
+```cpp
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Plan C-1: Blackwell-specific kernel traits
+// Gated by FLASH_FWD_USE_BLACKWELL_TRAITS macro.
+// When enabled, these traits override kBlockM/kBlockN/kNWarps for sm_100/120.
+// Default values are placeholders; C-1 tuning will replace them with measured optima.
+
+#ifdef FLASH_FWD_USE_BLACKWELL_TRAITS
+template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_,
+         bool Is_Q_in_regs_=false, bool Share_Q_K_smem_=false, typename elem_type=cutlass::half_t,
+         typename Base=Flash_fwd_kernel_traits<kHeadDim_, kBlockM_, kBlockN_, kNWarps_, elem_type>>
+struct Flash_fwd_kernel_traits_blackwell : public Base {
+    static constexpr int kNWarps = kNWarps_;
+    static constexpr int kNThreads = kNWarps * 32;
+    static constexpr int kBlockM = kBlockM_;
+    static constexpr int kBlockN = kBlockN_;
+    // Inherit smem layout, MMA atoms, copy atoms from Base.
+    // Only block sizes and warp counts are overridden.
+    // C-1 tuning will determine the optimal (kBlockM, kBlockN, kNWarps) per hdim.
+};
+#endif  // FLASH_FWD_USE_BLACKWELL_TRAITS
+```
+
+#### Edit 2: `flash_fwd_launch_template.h` — dispatch macro
+
+**Location:** At the top of each `run_mha_fwd_hdim*` function, add an arch check.
+
+**Pattern (shown for hdim=128, apply similarly to other hdims):**
+
+```cpp
+template<typename T, bool Is_causal>
+void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
+    constexpr static int Headdim = 128;
+    auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
+    bool is_blackwell = cc_major >= 10;
+    DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
+        if constexpr(!Is_dropout) {
+#ifdef FLASH_FWD_USE_BLACKWELL_TRAITS
+            if (is_blackwell) {
+                // C-1 tuned values for sm_100/120 — placeholders, replace after measurement
+                run_flash_fwd<Flash_fwd_kernel_traits_blackwell<Headdim, 128, 64, 8, false, false, T>, Is_dropout, Is_causal>(params, stream);
+                return;
+            }
+#endif
+            // ... existing sm_80/sm_90 dispatch ...
+        }
+    });
+}
+```
+
+#### Verification
+
+```powershell
+# Build with the macro defined:
+$env:NVCC_FLAGS = "-DFLASH_FWD_USE_BLACKWELL_TRAITS"
+.\WindowsWhlBuilder_cuda.bat
+
+# Benchmark comparison (requires Phase 0 baseline):
+python bench\fa2_baseline.py --output bench\baseline_blackwell.json
+# Compare against bench\baseline_sm80.json
+```
+
+---
+
+### 15.7 Build verification checklist
+
+After applying all edits in order (§15.1 → §15.2 → §15.3 → §15.4 → §15.5 → §15.6):
+
+| Step | Command | Expected result |
+|---|---|---|
+| Clean build | `.\WindowsWhlBuilder_cuda.bat` | No compile errors; wheel produced |
+| Smoke test (fp16) | `python -c "import torch; from flash_attn import flash_attn_func; ..."` | Output shape/dtype correct |
+| Smoke test (bf16) | Same with `dtype=torch.bfloat16` | Output shape/dtype correct |
+| A-1 accuracy | Compare output vs pre-change build | Relative L∞ ≤ 2e-2 (fp16), ≤ 1e-2 (bf16) |
+| A-2 SASS gate | `cuobjdump --dump-sass *.so \| Select-String "FFMA.X2"` | `FFMA.X2` present on sm_120 build |
+| A-4 SASS gate | `cuobjdump --dump-sass *.so \| Select-String "FMAX"` | Increased `FMAX` count vs pre-A-4 |
+| B-1 SASS gate (when enabled) | `cuobjdump --dump-sass *.so \| Select-String "MUFU.EX2"` | `MUFU.EX2` absent in emulated lanes on sm_120 |
+| B-1 accuracy (when enabled) | `pytest tests/test_flash_attn.py::test_flash_attn_output` | Relative L∞ ≤ 1e-2 (fp16), ≤ 5e-3 (bf16) |
+| B-2 accuracy (when enabled) | Same test per (freq, res, start) cell | Same thresholds as B-1 |
+| Logits cosine | LLM end-to-end prompt comparison | ≥ 0.9995 |
+
+### 15.8 Commit sequence
+
+Recommended commit order (each commit is independently buildable):
+
+| Commit | Contents | Phase |
+|---|---|---|
+| 1 | `M_LOG2E` fix (already in working tree) | Pre |
+| 2 | A-1 threshold revision (§15.1) | 1 |
+| 3 | A-4 packed reduction (§15.2) | 1 |
+| 4 | A-3 assert placeholder (§15.3) | 2 |
+| 5 | B-1 polynomial emulation (§15.4) | 2 |
+| 6 | B-2 mixed mode (§15.5, default off) | 2 |
+| 7 | C-1 Blackwell traits (§15.6, gated off) | 3 |
+
+Commits 2–3 can be squashed if Phase 1 lands as a single PR. Commits 4–6 should land individually for reviewability. Commit 7 is independent.
+
+## 16. A-1/A-2 Existing Implementation: Delta Fix Plan (2026-08-11)
+
+This section documents the concrete changes needed to bring the **already-applied** A-1 and A-2 implementations in line with the updated plan (§14) and the latest FA4 codebase. The refinements from `AI/A1_A2_REFINEMENTS_PLAN.md` (A-1-R1 through A-2-R6) are all already applied in commit `2eda0be`; this section covers only the **remaining deltas** discovered after the FA4 sync update (§14).
+
+### 16.1 Current state summary
+
+| Item | Status | Where |
+|---|---|---|
+| A-1: `Use_rescale_threshold` bool template | Applied | `softmax.h` line ~143 |
+| A-1: `kSoftmaxRescaleSkipThreshold = -0.01f` | Applied (A-1-R1) | `softmax.h` line ~120 |
+| A-1: `static_assert(!(Is_first && Use_rescale_threshold))` | Applied (A-1-R2) | `softmax.h` line ~144 |
+| A-1: Skip-cascade comment | Applied (A-1-R3) | `softmax.h` lines ~170–173 |
+| A-1: 4 call sites with `Use_rescale_threshold=true` | Applied | `flash_fwd_kernel.h` lines ~351, ~414, ~925, ~992 |
+| A-2: `fma_f32x2` helper in `utils.h` | Applied (A-2-R3) | `utils.h` line ~416 |
+| A-2: `scale_apply_exp2` sm_100+ packed-FMA path | Applied | `softmax.h` lines ~88–110 |
+| A-2: `static_assert(N1 % 2 == 0)` | Applied (A-2-R2) | `softmax.h` line ~100 |
+| A-2: `max_scale_exp2_sum` dead code removed | Applied (A-2-R1) | — (already gone) |
+| A-2: `UNFUSE_FMA` `#pragma message` | Applied (A-2-R4) | `utils.h` after `fma_f32x2` |
+| A-2: `bench/check_sass_gates.py` | Applied (A-2-R5) | `bench/check_sass_gates.py` |
+| A-2: bwd coverage comment | Applied (A-2-R6) | `softmax.h` lines ~72–77 |
+
+### 16.2 Delta list
+
+The following changes are needed to align the existing A-1/A-2 code with the updated plan (§14). Each delta is tagged with its source section and priority.
+
+---
+
+#### Delta 1 (HIGH): A-1 threshold type change — `bool` → `float` (from §14.1, §15.1)
+
+This is the largest delta. The current implementation uses a `bool Use_rescale_threshold` template parameter and a separate `kSoftmaxRescaleSkipThreshold = -0.01f` constant. The updated plan replaces both with a single `float RescaleThreshold = 0.0f` template parameter, set to `8.0f` at call sites.
+
+**Why:** FA4 evolved `rescale_threshold` from a bool to a float (default `8.0` for fp16/bf16). The `0.01` threshold is too conservative — FA4 validated `8.0` on B200. The float parameter unifies the threshold and its activation into one clean template argument.
+
+**Edit A — `softmax.h`, delete `kSoftmaxRescaleSkipThreshold` (line ~120):**
+
+Delete these 4 lines entirely:
+```cpp
+// Threshold below which softmax_rescale_o skips the O / row_sum rescale.
+// scores_scale = exp2(scaled_diff); scaled_diff is the negative excursion of
+// row_max from one iteration to the next, in units of softmax_scale_log2.
+// At -0.01f, scores_scale >= ~0.993 (worst-case relative error <= 0.7%).
+inline constexpr float kSoftmaxRescaleSkipThreshold = -0.01f;
+```
+
+The threshold value is now embedded in the template parameter at the call site, not a file-scope constant.
+
+**Edit B — `softmax.h`, change template signature (line ~143):**
+
+Before:
+```cpp
+template<bool Is_first, bool Check_inf=false, bool Use_rescale_threshold=false, typename Tensor0, typename Tensor1>
+__forceinline__ __device__ void softmax_rescale_o(Tensor0 &acc_s, Tensor1 &acc_o, float softmax_scale_log2) {
+    static_assert(!(Is_first && Use_rescale_threshold),
+                  "Use_rescale_threshold has no effect when Is_first=true; "
+                  "remove the flag from the Is_first=true call site.");
+```
+
+After:
+```cpp
+template<bool Is_first, bool Check_inf=false, float RescaleThreshold=0.0f, typename Tensor0, typename Tensor1>
+__forceinline__ __device__ void softmax_rescale_o(Tensor0 &acc_s, Tensor1 &acc_o, float softmax_scale_log2) {
+    static_assert(!(Is_first && RescaleThreshold > 0.0f),
+                  "RescaleThreshold > 0 has no effect when Is_first=true; "
+                  "remove the threshold from the Is_first=true call site.");
+```
+
+**Edit C — `softmax.h`, change skip condition (lines ~175–177):**
+
+Before:
+```cpp
+                if constexpr (Use_rescale_threshold) {
+                    if (scaled_diff >= kSoftmaxRescaleSkipThreshold) { continue; }
+                }
+```
+
+After:
+```cpp
+                if constexpr (RescaleThreshold > 0.0f) {
+                    if (scaled_diff >= -RescaleThreshold) { continue; }
+                }
+```
+
+Note on semantics change: The old code compared `scaled_diff >= -0.01` (i.e. skip when the rescale factor is within 1% of 1.0). The new code compares `scaled_diff >= -RescaleThreshold`. With `RescaleThreshold=8.0f`, this skips when `scaled_diff >= -8.0`, meaning `scores_scale >= exp2(-8.0) ≈ 0.0039`. This is far more aggressive but validated by FA4 on B200.
+
+**Edit D — `softmax.h`, update the skip-cascade comment (lines ~170–173):**
+
+Before:
+```cpp
+                // Optionally skip the O / row_sum rescale when the new row_max is virtually
+                // the same as the previous one (scaled_diff is a very small negative number,
+                // so scores_scale = exp2(scaled_diff) ~= 1.0).
+                // This skip does not compound across iterations: normalize_softmax_lse
+                // divides acc_o by row_sum, so the skipped factor cancels between
+                // numerator and denominator, bounding the relative error by the threshold.
+```
+
+After:
+```cpp
+                // Optionally skip the O / row_sum rescale when the new row_max is close
+                // enough to the previous one that the rescale factor is near 1.0.
+                // RescaleThreshold is in log2 units of the softmax scale: skip when
+                // scaled_diff >= -RescaleThreshold, i.e. scores_scale >= exp2(-RescaleThreshold).
+                // With RescaleThreshold=8.0 (FA4 default for fp16/bf16), scores_scale >= 0.0039.
+                // This skip does not compound across iterations: normalize_softmax_lse
+                // divides acc_o by row_sum, so the skipped factor cancels between
+                // numerator and denominator, bounding the relative error by the threshold.
+                // Safety: max_offset + RescaleThreshold < log2(dtype_max) must hold
+                // (see §14.3 static_assert, to be added when A-3 lands).
+```
+
+**Edit E — `flash_fwd_kernel.h`, update 4 call sites (lines ~351, ~414, ~925, ~992):**
+
+Before (all 4 sites, same pattern):
+```cpp
+softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/..., /*Use_rescale_threshold=*/true>(acc_s, acc_o, params.scale_softmax_log2);
+```
+
+After:
+```cpp
+softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/..., /*RescaleThreshold=*/8.0f>(acc_s, acc_o, params.scale_softmax_log2);
+```
+
+The 2 `Is_first=true` call sites (lines ~350, ~924) are unchanged — they don't pass the threshold parameter (defaults to `0.0f`).
+
+**Verification:**
+```powershell
+cd D:\USERFILES\GitHub\flash-attention
+.\WindowsWhlBuilder_cuda.bat
+# Smoke test
+python -c "import torch; from flash_attn import flash_attn_func; q=torch.randn(1,512,8,128,dtype=torch.float16,device='cuda'); k=torch.randn_like(q); v=torch.randn_like(q); o=flash_attn_func(q,k,v,causal=True); print('OK', o.shape, o.dtype)"
+# Accuracy: compare output against pre-change build
+# Acceptance: relative L∞ ≤ 2e-2 (fp16), ≤ 1e-2 (bf16), logits cosine ≥ 0.9995
+```
+
+---
+
+#### Delta 2 (LOW): A-1 `A1_A2_REFINEMENTS_PLAN.md` status update
+
+After Delta 1 lands, `AI/A1_A2_REFINEMENTS_PLAN.md` items A-1-R1 (file-scope constant) is superseded. The constant `kSoftmaxRescaleSkipThreshold` no longer exists. Add a note at the top of that document:
+
+```markdown
+> **Update 2026-08-11:** A-1-R1 is superseded by §14.1/§15.1 of the main plan.
+> The `kSoftmaxRescaleSkipThreshold` constant is deleted; the threshold is now
+> a `float RescaleThreshold` template parameter (default `8.0f` at call sites,
+> matching FA4). A-1-R2's `static_assert` is updated to check
+> `RescaleThreshold > 0.0f` instead of `Use_rescale_threshold`.
+```
+
+This is documentation-only; no code change.
+
+---
+
+#### Delta 3 (NONE): A-2 — no changes needed
+
+The A-2 implementation (`fma_f32x2` in `utils.h`, `scale_apply_exp2` sm_100+ packed-FMA path in `softmax.h`) is **already aligned** with the updated plan. Specifically:
+
+- `fma_f32x2` is in `utils.h` (A-2-R3 applied) ✅
+- `static_assert(N1 % 2 == 0)` is present (A-2-R2 applied) ✅
+- `UNFUSE_FMA` `#pragma message` is present (A-2-R4 applied) ✅
+- `max_scale_exp2_sum` dead code is removed (A-2-R1 applied) ✅
+- `bench/check_sass_gates.py` exists (A-2-R5 applied) ✅
+- bwd coverage comment is present (A-2-R6 applied) ✅
+- The `asm volatile` in `fma_f32x2` matches the PTX layout described in §14.4 ✅
+
+The only A-2-adjacent change is the **addition** of B-1's `exp2f_emu` / `exp2f_emu_x2` functions (§15.4) and the `Use_exp2_emu` template parameter on `scale_apply_exp2` (§15.4 Edit 2). These are additive — they don't modify the existing A-2 code path, only add a new conditional branch that defaults to the current behavior (`Use_exp2_emu=false`).
+
+No edit to the existing A-2 code is required.
+
+---
+
+#### Delta 4 (MEDIUM): `asm volatile` in `fma_f32x2` — consider removing `volatile`
+
+**Current** (`utils.h` line ~424):
+```cpp
+    asm volatile(
+```
+
+**Issue:** The `volatile` keyword prevents the compiler from reordering or CSE-ing the asm block. This was originally added defensively. However, the asm block has explicit outputs (`"=f"(d0), "=f"(d1)`) and inputs (`"f"(a0)...`), so the compiler already knows the data dependencies. `volatile` is only needed if the asm has side effects not captured by the constraints (e.g., writing to memory). Since `fma.rn.f32x2` is a pure computation, `volatile` is unnecessary and may prevent the compiler from optimizing surrounding code.
+
+FA4's equivalent (`cute.arch.fma_packed_f32x2`) does not use `volatile`.
+
+**Proposed change:**
+```cpp
+    asm(
+```
+
+Remove the `volatile` keyword. The output/input constraints are sufficient.
+
+**Risk:** Very low. If the compiler starts folding the asm block (which would be a problem), the SASS gate (`bench/check_sass_gates.py`) will catch it — `FFMA.X2` would disappear from the binary.
+
+**Verification:**
+```powershell
+# After rebuild, run SASS gate:
+python bench\check_sass_gates.py --pyd flash_attn_2_cuda.cp314-win_amd64.pyd --arch sm_120 --gate a2
+# Must exit 0 (FFMA.X2 present)
+```
+
+---
+
+#### Delta 5 (LOW): Add `RescaleThreshold` to the bwd path comment
+
+**Current** (`softmax.h` lines ~72–77):
+```cpp
+// Apply the exp to all the elements.
+// Note: this function is shared by:
+//   - fwd via Softmax::softmax_rescale_o (both Is_first branches), and
+//   - bwd via flash_bwd_kernel.h::compute_dq_dk_dv (Scale_max=false branch).
+// Both paths benefit equally from the sm_100+ packed-FMA inner loop below.
+```
+
+This comment is accurate. After Delta 1 lands, add a note about `RescaleThreshold`:
+
+```cpp
+// Apply the exp to all the elements.
+// Note: this function is shared by:
+//   - fwd via Softmax::softmax_rescale_o (both Is_first branches), and
+//   - bwd via flash_bwd_kernel.h::compute_dq_dk_dv (Scale_max=false branch).
+// Both paths benefit equally from the sm_100+ packed-FMA inner loop below.
+// RescaleThreshold (A-1) is applied only in softmax_rescale_o, not here;
+// this function is called after the threshold check has already passed.
+```
+
+Comment-only; no code change.
+
+---
+
+### 16.3 Implementation order
+
+| Step | Delta | Priority | Files | Binary change? |
+|---|---|---|---|---|
+| 1 | Delta 1 (A-1 threshold type change) | HIGH | `softmax.h`, `flash_fwd_kernel.h` | Yes — threshold widened from 0.01 to 8.0 |
+| 2 | Delta 4 (remove `volatile`) | MEDIUM | `utils.h` | Possibly — compiler may reorder differently |
+| 3 | Delta 5 (comment update) | LOW | `softmax.h` | No |
+| 4 | Delta 2 (doc update) | LOW | `AI/A1_A2_REFINEMENTS_PLAN.md` | No |
+| — | Delta 3 (A-2 changes) | NONE | — | — |
+
+Step 1 is the only change that affects numerical output. Step 2 may affect SASS layout but not correctness. Steps 3–4 are documentation.
+
+### 16.4 Commit recommendation
+
+| Commit | Contents | Deltas |
+|---|---|---|
+| 1 | A-1 threshold revision: `bool` → `float`, `0.01` → `8.0` | Delta 1 + Delta 5 (comment) |
+| 2 | Remove `volatile` from `fma_f32x2` asm + SASS gate re-verify | Delta 4 |
+| 3 | Doc update: mark A-1-R1 superseded in refinement plan | Delta 2 |
+
+Commit 1 should be validated with:
+- Full test suite (`pytest tests/test_flash_attn.py`)
+- SASS gate (`python bench\check_sass_gates.py --arch sm_120 --gate a2`)
+- Accuracy comparison against pre-change build (save reference outputs first)
+
+Commit 2 should be validated with:
+- SASS gate only (no numeric change expected)
+
+### 16.5 Rollback
+
+If Delta 1 causes accuracy regression beyond the widened threshold:
+
+1. Change `8.0f` back to `0.01f` at the 4 call sites in `flash_fwd_kernel.h` — this restores the conservative threshold while keeping the `float` parameter type.
+2. If the `float` type itself causes issues (unlikely — it's a compile-time constant), revert to `bool Use_rescale_threshold` + `kSoftmaxRescaleSkipThreshold`.
+
+The float parameter type is backward-compatible with any threshold value, so step 1 is a one-line-per-callsite change with no template surgery.
