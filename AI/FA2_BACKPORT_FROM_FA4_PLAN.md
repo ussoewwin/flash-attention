@@ -699,6 +699,38 @@ Same files as Plan A-1 (A-1 and A-2 were applied in the same edit session). The 
 
 Backup: `D:\USERFILES\_backups\flash-attention_20260513_092006\__init__.py.orig`.
 
+
+### 11.5 2026-08-12 — 2.9.2.post1 Delta 1+4+5+6 applied
+
+**Commits:**
+| Commit | Description |
+|---|---|
+| `5b068de` | fix(softmax): A-1 rescale threshold upgrade + FA4-style max lagging |
+| `9abf358` | perf(asm): remove volatile from fma_f32x2 inline asm (Delta 4) |
+| `b6dad32` | docs: add Delta 6 to plan + bump version to 2.9.2.post1 |
+| `eea0f68` | docs: add 2.9.2.post1 complete test and validation guide |
+
+**Files changed (working tree, post-commit):**
+| File | Change |
+|---|---|
+| `csrc/flash_attn/src/softmax.h` | Delta 1+5+6: `bool Use_rescale_threshold` → `float RescaleThreshold=0.0f`, constant deletion, max-lagging skip logic, comment update |
+| `csrc/flash_attn/src/flash_fwd_kernel.h` | Delta 1: 4 call sites `/*RescaleThreshold=*/8.0f` |
+| `csrc/flash_attn/src/utils.h` | Delta 4: `asm volatile(` → `asm(` |
+| `flash_attn/__init__.py` | Version: `2.9.1` → `2.9.2.post1` |
+| `setup2.py` | Version: `2.9.2` → `2.9.2.post1` |
+| `AI/FA2_BACKPORT_FROM_FA4_PLAN.md` | §16 Delta 6 added |
+
+**Test results (RTX 5060 Ti, sm_120, CUDA 13.2, PyTorch 2.13.0):**
+- 56 tests total across 18 accuracy shapes, 10 edge cases, 7 API paths, backward, latency
+- fp16: 12/12 accuracy PASS (worst rel_Linf=7.94e-04 vs gate 2e-2)
+- bf16: 6/6 accuracy PASS (worst rel_Linf=6.54e-03 vs gate 1e-2)
+- All cosines >= 0.99999768 vs gate 0.9995
+- Backward: all finite, grad accuracy dQ=2.10e-05, dK=1.86e-05, dV=1.47e-03 vs fp32 ref
+- Determinism: bit-identical across runs
+- SASS gate: FFMA.X2 not found on sm_120 (Blackwell encoding differs from Hopper)
+
+See `md/2.9.2.post1_COMPLETE_TEST_AND_VALIDATION_GUIDE.md` for full details.
+
 ### 11.4 Pending
 
 - Phase 0 measurement harness (`bench/fa2_baseline.py`)
@@ -1137,7 +1169,10 @@ __forceinline__ __device__ void softmax_rescale_o(Tensor0 &acc_s, Tensor1 &acc_o
 **After:**
 ```cpp
                 if constexpr (RescaleThreshold > 0.0f) {
-                    if (scaled_diff >= -RescaleThreshold) { continue; }
+                    if (scaled_diff >= -RescaleThreshold) {
+                        row_max(mi) = scores_max_prev(mi);   // FA4-style max lagging
+                        continue;
+                    }
                 }
 ```
 
@@ -1848,7 +1883,7 @@ After:
                 }
 ```
 
-Note on semantics change: The old code compared `scaled_diff >= -0.01` (i.e. skip when the rescale factor is within 1% of 1.0). The new code compares `scaled_diff >= -RescaleThreshold`. With `RescaleThreshold=8.0f`, this skips when `scaled_diff >= -8.0`, meaning `scores_scale >= exp2(-8.0) ≈ 0.0039`. This is far more aggressive but validated by FA4 on B200.
+Note on semantics change (includes Delta 6 max-lagging; see §16 Delta 6 for correctness proof): The old code compared `scaled_diff >= -0.01` (i.e. skip when the rescale factor is within 1% of 1.0). The new code compares `scaled_diff >= -RescaleThreshold`. With `RescaleThreshold=8.0f`, this skips when `scaled_diff >= -8.0`, meaning `scores_scale >= exp2(-8.0) ≈ 0.0039`. This is far more aggressive but validated by FA4 on B200.
 
 **Edit D — `softmax.h`, update the skip-cascade comment (lines ~170–173):**
 
@@ -1869,9 +1904,13 @@ After:
                 // RescaleThreshold is in log2 units of the softmax scale: skip when
                 // scaled_diff >= -RescaleThreshold, i.e. scores_scale >= exp2(-RescaleThreshold).
                 // With RescaleThreshold=8.0 (FA4 default for fp16/bf16), scores_scale >= 0.0039.
-                // This skip does not compound across iterations: normalize_softmax_lse
-                // divides acc_o by row_sum, so the skipped factor cancels between
-                // numerator and denominator, bounding the relative error by the threshold.
+                // FA4-style max lagging (Delta 6, 2026-08-12): on skip, revert row_max to the
+                // previous value so that scale_apply_exp2 below computes P on the same base as
+                // the (unrescaled) running O and row_sum. The output and LSE are then exact --
+                // normalize_softmax_lse divides by a row_sum on the same base.
+                // The rescale (and base advance) only happens when the row max moves by
+                // more than RescaleThreshold log2 units.
+                // See §16 Delta 6 for the correctness proof (LSE identity derivation).
                 // Safety: max_offset + RescaleThreshold < log2(dtype_max) must hold
                 // (see §14.3 static_assert, to be added when A-3 lands).
 ```
