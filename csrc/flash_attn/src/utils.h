@@ -419,7 +419,7 @@ __forceinline__ __device__ void fma_f32x2(
     float b0, float b1,
     float c0, float c1) {
 #if __CUDA_ARCH__ >= 1000 && !defined(UNFUSE_FMA)
-    asm volatile(
+    asm(
         "{\n\t"
         ".reg .b64 ra, rb, rc, rd;\n\t"
         "mov.b64 ra, {%2, %3};\n\t"
