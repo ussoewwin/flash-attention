@@ -74,6 +74,8 @@ __device__ __forceinline__ void reduce_sum(Tensor<Engine0, Layout0> const& tenso
 //   - fwd via Softmax::softmax_rescale_o (both Is_first branches), and
 //   - bwd via flash_bwd_kernel.h::compute_dq_dk_dv (Scale_max=false branch).
 // Both paths benefit equally from the sm_100+ packed-FMA inner loop below.
+// RescaleThreshold (A-1) is applied only in softmax_rescale_o, not here;
+// this function is called after the threshold check has already passed.
 template <bool Scale_max=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
 __forceinline__ __device__ void scale_apply_exp2(Tensor<Engine0, Layout0> &tensor, Tensor<Engine1, Layout1> const &max, const float scale) {
     static_assert(Layout0::rank == 2, "Only support 2D Tensor");
@@ -125,12 +127,6 @@ __forceinline__ __device__ void scale_apply_exp2(Tensor<Engine0, Layout0> &tenso
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Threshold below which softmax_rescale_o skips the O / row_sum rescale.
-// scores_scale = exp2(scaled_diff); scaled_diff is the negative excursion of
-// row_max from one iteration to the next, in units of softmax_scale_log2.
-// At -0.01f, scores_scale >= ~0.993 (worst-case relative error <= 0.7%).
-inline constexpr float kSoftmaxRescaleSkipThreshold = -0.01f;
-
 template <int kNRows>
 struct Softmax {
 
@@ -139,11 +135,11 @@ struct Softmax {
 
     __forceinline__ __device__ Softmax() {};
 
-    template<bool Is_first, bool Check_inf=false, bool Use_rescale_threshold=false, typename Tensor0, typename Tensor1>
+    template<bool Is_first, bool Check_inf=false, float RescaleThreshold=0.0f, typename Tensor0, typename Tensor1>
     __forceinline__ __device__ void softmax_rescale_o(Tensor0 &acc_s, Tensor1 &acc_o, float softmax_scale_log2) {
-        static_assert(!(Is_first && Use_rescale_threshold),
-                      "Use_rescale_threshold has no effect when Is_first=true; "
-                      "remove the flag from the Is_first=true call site.");
+        static_assert(!(Is_first && RescaleThreshold > 0.0f),
+                      "RescaleThreshold > 0 has no effect when Is_first=true; "
+                      "remove the threshold from the Is_first=true call site.");
         // Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(acc_s.layout()));
         static_assert(decltype(size<0>(scores))::value == kNRows);
@@ -164,14 +160,23 @@ struct Softmax {
                     ? row_max(mi)
                     : (row_max(mi) == -INFINITY ? 0.0f : row_max(mi));
                 float scaled_diff = (scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2;
-                // Optionally skip the O / row_sum rescale when the new row_max is virtually
-                // the same as the previous one (scaled_diff is a very small negative number,
-                // so scores_scale = exp2(scaled_diff) ~= 1.0).
-                // This skip does not compound across iterations: normalize_softmax_lse
-                // divides acc_o by row_sum, so the skipped factor cancels between
-                // numerator and denominator, bounding the relative error by the threshold.
-                if constexpr (Use_rescale_threshold) {
-                    if (scaled_diff >= kSoftmaxRescaleSkipThreshold) { continue; }
+                // Optionally skip the O / row_sum rescale when the new row_max is close
+                // enough to the previous one that the rescale factor is near 1.0.
+                // RescaleThreshold is in log2 units of the softmax scale: skip when
+                // scaled_diff >= -RescaleThreshold, i.e. scores_scale >= exp2(-RescaleThreshold).
+                // With RescaleThreshold=8.0 (FA4 default for fp16/bf16), scores_scale >= 0.0039.
+                // FA4-style max lagging: on skip, revert row_max to the previous value so that
+                // scale_apply_exp2 below computes P on the same base as the (unrescaled) running
+                // O and row_sum. The output and LSE are then exact -- normalize_softmax_lse
+                // divides by a row_sum on the same base. The rescale (and base advance) only
+                // happens when the row max moves by more than RescaleThreshold log2 units.
+                // Safety: max_offset + RescaleThreshold < log2(dtype_max) must hold
+                // (see section 14.3 static_assert, to be added when A-3 lands).
+                if constexpr (RescaleThreshold > 0.0f) {
+                    if (scaled_diff >= -RescaleThreshold) {
+                        row_max(mi) = scores_max_prev(mi);
+                        continue;
+                    }
                 }
                 float scores_scale = exp2f(scaled_diff);
                 row_sum(mi) *= scores_scale;
