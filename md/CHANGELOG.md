@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.7 — 2026-08-12
+
+- **Summary:** Fork release **v1.7** / package **`flash_attn` 2.9.2.post1** — patch on the 2.9.2 `split_align` line. **A-1:** `softmax_rescale_o` uses float template `RescaleThreshold` (call sites `8.0f`, FA4 16-bit default) in place of a bool / `-0.01f` skip; on skip, FA4-style max lagging restores `row_max` to the previous value so running O, `row_sum`, and P share one base (exact output and LSE). **A-2:** `fma_f32x2` packed `fma.rn.f32x2` on sm_100+ drops `volatile` so the compiler may schedule the instruction. Same Blackwell / legacy wheel split as v1.6 (`bat2` `100;120;121`, `bat3` `80;89;90`).
+- **Release (GitHub):** https://github.com/ussoewwin/flash-attention/releases/tag/v1.7
+
 ## v1.6 — 2026-07-13
 
 - **Summary:** Fork release **v1.6** / package **`flash_attn` 2.9.2** — Official merge of the `split_align` architecture. Extracted the `num_splits == 1` forward pass alignment kernels into 24 independent compilation units (`flash_fwd_split_align_*.cu`) to resolve NVIDIA `ptxas` compiler timeouts and serial compilation crashes. To bypass the Windows MSVC 2GB linker limit (LNK1189) caused by compiling these massive object files, the build scripts were physically split into `bat2` (Blackwell: `100;120;121`) and `bat3` (Ampere/Hopper: `80;89;90`). Dynamic runtime versioning implemented in `__init__.py` to correctly branch between `2.9.1` and `2.9.2`.
