@@ -2028,3 +2028,45 @@ If Delta 1 causes accuracy regression beyond the widened threshold:
 2. If the `float` type itself causes issues (unlikely — it's a compile-time constant), revert to `bool Use_rescale_threshold` + `kSoftmaxRescaleSkipThreshold`.
 
 The float parameter type is backward-compatible with any threshold value, so step 1 is a one-line-per-callsite change with no template surgery.
+
+
+---
+
+#### Delta 6 (HIGH, 2026-08-12): FA4-style max lagging — revert `row_max` on skip (required for threshold 8.0 correctness)
+
+**Discovered during implementation verification (2026-08-12).** This is a correctness requirement that the original Delta 1 did not specify.
+
+**Problem:** The Delta 1 skip logic (`if (scaled_diff >= -RescaleThreshold) { continue; }`) skips the O / row_sum rescale, but `scale_apply_exp2` afterwards still uses the **new** `row_max` (already updated by `reduce_max<false>`). With the old threshold `0.01` the inconsistency is bounded (scores_scale >= 0.993, error <= 0.7% — the documented A-1 tradeoff). With `RescaleThreshold=8.0`, `scores_scale` can be as small as `exp2(-8) ≈ 0.0039`, so a skipped block's contribution to the running O/row_sum is overweighted by up to ~256x — a real correctness bug.
+
+**FA4 reference:** `flash_attn/cute/softmax.py::SoftmaxSm100.update_row_max` (and `update_row_max_from_local`) does:
+
+```python
+if acc_scale_ >= -self.rescale_threshold:
+    row_max_new = row_max_old      # keep the OLD max
+    row_max_safe = row_max_old     # exp2 subtraction uses the OLD max
+    acc_scale = 1.0
+self.row_max[0] = row_max_new
+```
+
+So on skip, FA4 **keeps the old max** as the base: P is computed on the same base as the unrescaled O/row_sum, and the online softmax remains **exact** (the max simply lags). FA3 (`hopper/softmax.h`) has no rescale-threshold skip at all, so FA4 is the only reference.
+
+**Fix (applied to `softmax.h`):**
+
+```cpp
+if constexpr (RescaleThreshold > 0.0f) {
+    if (scaled_diff >= -RescaleThreshold) {
+        row_max(mi) = scores_max_prev(mi);   // FA4-style max lagging
+        continue;
+    }
+}
+```
+
+**Why it is exact:** with base `m_prev` kept, `P = exp2(S·scale − m_prev·scale)` and O/row_sum stay on `m_prev`. The final `normalize_softmax_lse` divides by the same-base row_sum. Derivation:
+
+- Correct: `LSE = m_cur·scale + log(RS_prev·ss + RS_cur)`, `ss = exp2((m_prev−m_cur)·scale_log2)`
+- Lagging: `LSE = m_prev·scale + log(RS_prev + RS_cur/ss) = m_cur·scale + log(RS_prev·ss + RS_cur)` — identical ✓
+- Output `O/RS`: multiplying numerator and denominator by `1/ss` shows the same equivalence ✓
+
+**P-saturation note:** with max lagging, P can reach `exp2(RescaleThreshold) = 256` before the fp16/bf16 conversion. This is well within fp16 max (65504) and bf16 max (3.39e38), so no overflow. The `max_offset + rescale_threshold < log2(dtype_max)` assert (§14.3) is only relevant for a future fp8 path, unchanged.
+
+**Affected plan text:** §16.1 Edit C and Edit D are superseded by the applied code (see the committed `softmax.h`). The Edit D comment in the code now documents the max-lagging behavior instead of the 0.7% bound.
