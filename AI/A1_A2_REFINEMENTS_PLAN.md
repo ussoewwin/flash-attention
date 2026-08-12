@@ -311,3 +311,129 @@ Once any of A-1-Rn / A-2-Rn lands, append an entry under `§11 Change Log` of `A
 - Original plan: `AI/FA2_BACKPORT_FROM_FA4_PLAN.md` §5.1, §5.2, §6, §7.1, §7.2, §8.2, §9 (R2, R8), §10.1, §10.2, §10.3, §11.1, §11.2.
 - Implementation walk-through: `md/FA2_CHANGES_v1.2.md` §1, §2.
 - Verification procedure (manual): `md/2.9.0_COMPLETE_TEST_AND_VALIDATION_GUIDE.md` §10 (A-1), §11 (A-2).
+
+
+## 7. 2.9.2.post1 Update (2026-08-12) — Delta 1/4/5/6 Applied
+
+This section supplements the original refinement plan with changes applied in the
+2.9.2.post1 release of `ussoewwin/flash-attention` (commits `5b068de` through `eea0f68`).
+
+### 7.1 Refinements already applied before 2.9.2.post1 (commit `2eda0be`)
+
+Several A-2 refinements from §2 were applied in commit `2eda0be`
+("refactor(fa2): A1/A2 refinements from FA4 backport plan"):
+
+| Refinement | Status |
+|---|---|
+| A-2-R2 | **Applied.** `static_assert(N1 % 2 == 0)` replaces `if constexpr (N1 % 2 != 0)` tail. |
+| A-2-R3 | **Applied.** `fma_f32x2` moved from `softmax.h` to `utils.h`. |
+| A-2-R4 | **Applied.** `#pragma message` warns when `UNFUSE_FMA` is set on sm_100+. |
+| A-2-R6 | **Applied.** Comment documents bwd-side coverage of `scale_apply_exp2`. |
+| A-1-R2 | **Applied (partially).** `static_assert(!(Is_first && Use_rescale_threshold))` guards `Is_first=true` call sites. Updated in Delta 1 to use `float RescaleThreshold`. |
+
+### 7.2 Delta 1: A-1 threshold type change
+
+The original A-1 used `bool Use_rescale_threshold` with a hardcoded `-0.01f` threshold.
+This was superseded by:
+
+- **Template change:** `float RescaleThreshold=0.0f` replaces `bool Use_rescale_threshold=false`.
+- **Constant deletion:** `kSoftmaxRescaleSkipThreshold = -0.01f` removed entirely.
+  The threshold is now passed as a compile-time float at the call site.
+- **Call sites:** 4 `Is_first=false` invocations pass `/*RescaleThreshold=*/8.0f`
+  (matching FA4's default for fp16/bf16 on B200).
+- **`static_assert`:** `!(Is_first && RescaleThreshold > 0.0f)` guards `Is_first=true` call sites.
+
+This replaces A-1-R1's proposal (a named file-scope constant). The new approach
+aligns the fork with FA4's design: the threshold is type-specific (`8.0` for
+16-bit Q, `0.0` for 8-bit), and embedding it as a template parameter enables
+future per-dtype dispatch.
+
+### 7.3 Delta 6: FA4-style max lagging (discovered 2026-08-12)
+
+**Problem:** The original A-1 skip semantics (use new `row_max` for `scale_apply_exp2`
+while keeping the rescale factor at `1.0`) is correct for a small threshold (0.01, ≤0.7%
+error). At the FA4-derived threshold `8.0`, the inconsistency would over-weight stale block
+contributions by up to `1/exp2(-8) ≈ 256×`.
+
+**FA4 reference:** `flash_attn/cute/softmax.py::SoftmaxSm100.update_row_max` reverts
+`row_max_new = row_max_old` on skip, making the online softmax **exact** (the max
+simply lags, and the output and LSE are mathematically identical to the full-rescale path).
+
+**Fix applied (Delta 6):**
+
+```cpp
+// In softmax_rescale_o's per-row loop:
+if constexpr (RescaleThreshold > 0.0f) {
+    if (scaled_diff >= -RescaleThreshold) {
+        row_max(mi) = scores_max_prev(mi);   // FA4-style max lagging
+        continue;
+    }
+}
+```
+
+**Correctness proof:** With max lagging, `P = exp2(S·scale − m_prev·scale)` and
+O/row_sum stay on `m_prev`. The final `normalize_softmax_lse` divides by the
+same-base row_sum. LSE identity: `m_prev·s + log(RS_prev + RS_cur/ss) = m_cur·s + log(RS_prev·ss + RS_cur).`
+
+**P-saturation:** P can reach `exp2(8) = 256`, well within fp16 max (65504) and
+bf16 max (3.39e38). No overflow risk.
+
+### 7.4 Delta 4: Remove `volatile` from `fma_f32x2` asm
+
+In `utils.h`, `fma_f32x2`: `asm volatile(` → `asm(`. This matches FA4's
+`cute.arch.fma_packed_f32x2` which does not use `volatile`. On sm_120, `ptxas`
+may lower `fma.rn.f32x2` to scalar FFMA pairs; the `volatile` removal allows
+the compiler to schedule them more freely.
+
+### 7.5 Delta 5: Comment update
+
+`scale_apply_exp2` doc-comment notes that `RescaleThreshold` (A-1) is applied
+only in `softmax_rescale_o`, not here; this function is called after the
+threshold check has passed.
+
+### 7.6 Version
+
+Bumped from `2.9.2` to `2.9.2.post1` in:
+- `flash_attn/__init__.py` (fallback `__version__`)
+- `setup2.py` (`public_version`)
+- `setup.py` reads version dynamically from `__init__.py`
+
+### 7.7 Build and Test Results
+
+**Environment:** RTX 5060 Ti (sm_120), CUDA 13.2, PyTorch 2.13.0, Python 3.14.6.
+
+**Commits:**
+| Commit | Description |
+|---|---|
+| `5b068de` | fix(softmax): A-1 rescale threshold upgrade + FA4-style max lagging |
+| `9abf358` | perf(asm): remove volatile from fma_f32x2 inline asm (Delta 4) |
+| `b6dad32` | docs: add Delta 6 to plan + bump version to 2.9.2.post1 |
+| `eea0f68` | docs: add 2.9.2.post1 complete test and validation guide |
+
+**Test summary (56 tests, all PASS):**
+
+| Category | Cases | Result |
+|---|---|---|
+| Accuracy vs fp32 ref (fp16) | 12 shapes, S=512–8192, D=64/128/256 | Worst rel_Linf=7.94e-04 (gate ≤2e-2) |
+| Accuracy vs fp32 ref (bf16) | 6 shapes, S=512–4096, D=64/128 | Worst rel_Linf=6.54e-03 (gate ≤1e-2) |
+| Edge cases | S=1, S=2, H=1, D=256 bf16, return_lse, softcap+causal, window_size | All PASS |
+| Backward | fp16/bf16 finiteness + grad accuracy vs fp32 ref | All finite; dQ=2.10e-05, dK=1.86e-05, dV=1.47e-03 |
+| Varlen | forward + backward | All PASS |
+| Determinism | Same input → same output | Bit-identical |
+| API surface | 7 paths (flash_attn_func, varlen, kvcache, window, alibi, softcap) | All PASS |
+| Latency | S=1024–8192, D=64/128 | 0.079–6.504 ms/iter, matches 2.9.0 baseline |
+
+**SASS gate (A-2):** 96 sm_120 cubins scanned. `FFMA.X2` **not found**. On sm_120
+(Blackwell), `fma.rn.f32x2` PTX appears to be lowered to scalar FFMA pairs by `ptxas`.
+The `check_sass_gates.py` tool (A-2-R5) needs an sm_120 instruction pattern update.
+Accuracy is unaffected: all 28 accuracy + 10 edge cases pass comfortably.
+
+Full details: `md/2.9.2.post1_COMPLETE_TEST_AND_VALIDATION_GUIDE.md`.
+
+### 7.8 Refinements Still Pending
+
+| Refinement | Status | Note |
+|---|---|---|
+| A-2-R1 | **Not applied.** `max_scale_exp2_sum` dead code still present; plan misattribution not yet corrected. | Low priority; no binary impact. |
+| A-1-R3 | **Not applied (superseded).** Comment was updated with max-lagging text instead (Delta 5+6). |
+| A-2-R5 | **Partial.** `bench/check_sass_gates.py` exists but needs sm_120 support. |
