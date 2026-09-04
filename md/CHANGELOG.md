@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.8 — 2026-09-04
+
+- **Summary:** Fork release **v1.8** — PyTorch **2.14.0+cu132** Windows compatibility verification and upstream sync.
+  - **PyTorch 2.14.0 C++ ABI compatibility:** Validated MSVC linking against PyTorch 2.14.0's updated `c10::cuda::c10_cuda_check_implementation` (6-argument signature with `CUDAErrorLogCapture* = nullptr`). Clean-build verification resolves LNK2001/LNK1120 unresolved externals caused by outdated object files.
+  - **Upstream sync (`ce088ab`):** Merged official upstream improvements for FA4 / CuTe DSL (SM100 scalar mask-mod compilation speedup `#2819`, CUTLASS DSL `>=4.6.2` floor `#2798`, Quack packed subtraction compatibility `#2787`).
+  - **Fork preservation:** FA2 core kernel implementations (`csrc/flash_attn/`), 24 `split_align` kernels, MSVC 2GB-limit bypass (bat2/bat3 SM split), and workflow-removal policy (`tools/ci` suppression) are 100% preserved.
+  - **Build scripts:** Adjusted `MAX_JOBS=5` in `WindowsWhlBuilder_cuda_3.bat`.
+- **Release notes:** [v1.8_RELEASE.md](v1.8_RELEASE.md)
+
 ## v1.7 — 2026-08-12
 
 - **Summary:** Fork release **v1.7** / package **`flash_attn` 2.9.2.post1** — patch on the 2.9.2 `split_align` line. **A-1:** `softmax_rescale_o` uses float template `RescaleThreshold` (call sites `8.0f`, FA4 16-bit default) in place of a bool / `-0.01f` skip; on skip, FA4-style max lagging restores `row_max` to the previous value so running O, `row_sum`, and P share one base (exact output and LSE). **A-2:** `fma_f32x2` packed `fma.rn.f32x2` on sm_100+ drops `volatile` so the compiler may schedule the instruction. Same Blackwell / legacy wheel split as v1.6 (`bat2` `100;120;121`, `bat3` `80;89;90`).
