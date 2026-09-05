@@ -43,3 +43,12 @@ benchmarks/results/
 flash_attn_config.py
 # but keep the committed package shim that re-exports it
 !hopper/flash_attn_3/flash_attn_config.py
+
+# Logs and temporary files
+*.log
+反省文/
+scratch/
+*.bak*
+*.tmp
+temp/
+tmp/

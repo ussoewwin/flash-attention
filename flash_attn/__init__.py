@@ -7,7 +7,7 @@ try:
     from importlib.metadata import version
     __version__ = version("flash_attn").split("+")[0]
 except Exception:
-    __version__ = "2.9.2.post1"
+    __version__ = "2.9.2.post2"
 
 from flash_attn.flash_attn_interface import (
     flash_attn_func,

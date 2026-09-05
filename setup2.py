@@ -654,7 +654,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
 
 
 def get_package_version():
-    public_version = "2.9.2.post1"
+    public_version = "2.9.2.post2"
     local_version = os.environ.get("FLASH_ATTN_LOCAL_VERSION")
     if local_version:
         return f"{public_version}+{local_version}"
