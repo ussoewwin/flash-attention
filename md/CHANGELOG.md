@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.8.1 — 2026-09-05
+
+- **Summary:** Fork release **v1.8.1** / package **`flash_attn` 2.9.2.post2** — CUTLASS submodule upgrade to v4.6.2 and package patch bump.
+  - **CUTLASS submodule upgrade (`v4.6.2`):** Synchronized `csrc/cutlass` from `v4.3.4` to **`v4.6.2`** (`6c65a17`), aligning the C++ CUTLASS headers with the FA4 CuTe DSL requirement (`nvidia-cutlass-dsl>=4.6.2`). FA2 backward compatibility for numeric primitives (`half_t`, `bfloat16_t`, `Array`) is fully maintained.
+  - **Package version bump (`2.9.2.post2`):** Updated package version to `2.9.2.post2` in `flash_attn/__init__.py` and `setup2.py`.
+  - **Build environment & repository hygiene:** Cleared legacy compilation artifacts (`build/`) for clean builds, and updated `.gitignore` with comprehensive log and temporary file exclusion rules.
+- **Release notes:** [v1.8.1_RELEASE.md](v1.8.1_RELEASE.md)
+
 ## v1.8 — 2026-09-04
 
 - **Summary:** Fork release **v1.8** — PyTorch **2.14.0+cu132** Windows compatibility verification and upstream sync.
