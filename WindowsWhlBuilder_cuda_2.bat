@@ -8,7 +8,7 @@ rem For torch 2.11+cu130, ensure that python has torch.version.cuda major 13 (re
 rem =============================================================================
 setlocal enabledelayedexpansion
 
-set MAX_JOBS=6
+set MAX_JOBS=4
 
 :parseArgs
 rem Assigning a value to MAX_JOBS via a variable does not work in ninja, I don't know why

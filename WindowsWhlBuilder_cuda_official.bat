@@ -3,7 +3,7 @@ rem ============================================================================
 rem FlashAttention Windows wheel builder (canonical entry for this repo copy).
 rem - Uses FLASH_ATTENTION_FORCE_BUILD=TRUE: always compiles from source (no GitHub wheel download).
 rem - Run with the SAME python.exe you use at runtime (e.g. ComfyUI python_embeded).
-rem Optional args (repeatable): FORCE_CXX11_ABI TRUE|FALSE   CUDA_ARCH 80;90;100;120
+rem Optional args (repeatable): FORCE_CXX11_ABI TRUE|FALSE   CUDA_ARCH 80;89;90;100;120;121
 rem For torch 2.11+cu130, ensure that python has torch.version.cuda major 13 (rename step uses it).
 rem =============================================================================
 setlocal enabledelayedexpansion
@@ -54,7 +54,7 @@ set FLASH_ATTENTION_FORCE_BUILD=TRUE
 set BUILD_TARGET=cuda
 set DISTUTILS_USE_SDK=1
 set dist_dir=dist
-rem set FLASH_ATTN_CUDA_ARCHS=80;90;100;120
+rem set FLASH_ATTN_CUDA_ARCHS=80;89;90;100;120;121
 
 python setup.py bdist_wheel --dist-dir=%dist_dir%
 
