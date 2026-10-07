@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.8.2 - 2026-10-07
+
+- **Summary:** Fork release **v1.8.2** / package **`flash_attn` 2.9.2.post2** - upstream sync merge (`ce088ab` -> `76d93310`, 47 commits). The upstream changes are FA4 / CuTe DSL focused (1CTA MLA forward, hd256 forward/backward unification, sparse MLA training precision, SM90 fixes, Windows CUDA 13 / PyTorch 2.13+ build support). **FA2 CUDA kernels (`csrc/flash_attn/`) are byte-identical to v1.8.1 (zero diff); the FA-2-relevant changes are confined to the build system:**
+  - **Dynamic C++ standard selection (`setup.py`):** `-std=c++20` for PyTorch >= 2.13 (ATen C++20 requirement), `-std=c++17` otherwise, replacing the fork's hardcoded C++20 flags (`nvcc` / `cl`).
+  - **MSVC `/permissive` (upstream #2872):** under C++20 on Windows, `-Xcompiler /permissive` is passed to nvcc host compilation only (never the cl flags) to avoid MSVC 2022 (<19.50) rejecting CuTe templates (C3545 in `cute/stride.hpp`) with CUDA 13.x.
+  - **gencode bookkeeping:** `add_cuda_gencodes()` tracks `supported_archs`, raises `RuntimeError` when the installed toolkit supports none of the requested architectures, and embeds forward-compat PTX for the newest *supported* arch.
+  - **ROCm path only (no effect on CUDA FA2 wheels):** `FLASH_ATTENTION_USE_SYSTEM_AITER=TRUE` opt-in with `check_system_aiter()` validation, CK backend fixes (`csrc/flash_attn_ck`), and the `third_party/aiter` submodule pointer update.
+  - **Fork preservation (verified by diff):** `sm_89` + `sm_121` (via `compute_120f`) gencodes, Thor exclusion (`FORK_THOR_CUDA_ARCHS` filtering), MSVC `/Zc:preprocessor` + `-D_USE_MATH_DEFINES` (M_LOG2E), 24 `split_align` kernels, `WindowsWhlBuilder_cuda*.bat` (`MAX_JOBS=5`), and the zero-CI policy are all intact.
+- **Release notes:** [v1.8.2_RELEASE.md](v1.8.2_RELEASE.md) *(to be published)*
+
 ## v1.8.1 — 2026-09-05
 
 - **Summary:** Fork release **v1.8.1** / package **`flash_attn` 2.9.2.post2** — CUTLASS submodule upgrade to v4.6.2 and package patch bump.
