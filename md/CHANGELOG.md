@@ -8,7 +8,7 @@
   - **gencode bookkeeping:** `add_cuda_gencodes()` tracks `supported_archs`, raises `RuntimeError` when the installed toolkit supports none of the requested architectures, and embeds forward-compat PTX for the newest *supported* arch.
   - **ROCm path only (no effect on CUDA FA2 wheels):** `FLASH_ATTENTION_USE_SYSTEM_AITER=TRUE` opt-in with `check_system_aiter()` validation, CK backend fixes (`csrc/flash_attn_ck`), and the `third_party/aiter` submodule pointer update.
   - **Fork preservation (verified by diff):** `sm_89` + `sm_121` (via `compute_120f`) gencodes, Thor exclusion (`FORK_THOR_CUDA_ARCHS` filtering), MSVC `/Zc:preprocessor` + `-D_USE_MATH_DEFINES` (M_LOG2E), 24 `split_align` kernels, `WindowsWhlBuilder_cuda*.bat` (`MAX_JOBS=5`), and the zero-CI policy are all intact.
-- **Release (GitHub):** https://github.com/ussoewwin/flash-attention/releases/tag/v1.8.2
+- **Release notes:** [v1.8.2 Release (GitHub)](https://github.com/ussoewwin/flash-attention/releases/tag/v1.8.2)
 
 ## v1.8.1 — 2026-09-05
 
