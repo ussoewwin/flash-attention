@@ -2,6 +2,7 @@
 
 import sys
 import functools
+import importlib.util
 import warnings
 import os
 import re
@@ -62,6 +63,7 @@ BASE_WHEEL_URL = (
 # SKIP_CUDA_BUILD: Intended to allow CI to use a simple `python setup.py sdist` run to copy over raw files, without any cuda compilation
 FORCE_BUILD = os.getenv("FLASH_ATTENTION_FORCE_BUILD", "FALSE") == "TRUE"
 SKIP_CUDA_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CUDA_BUILD", "FALSE") == "TRUE"
+USE_SYSTEM_AITER = os.getenv("FLASH_ATTENTION_USE_SYSTEM_AITER", "FALSE") == "TRUE"
 # For CI, we want the option to build with C++11 ABI since the nvcr images use C++11 ABI
 FORCE_CXX11_ABI = os.getenv("FLASH_ATTENTION_FORCE_CXX11_ABI", "FALSE") == "TRUE"
 ROCM_BACKEND: Optional[Literal["triton", "ck"]] = None
@@ -137,22 +139,27 @@ def add_cuda_gencodes(cc_flag, archs, bare_metal_version):
       - sm_80/90 (regular)
       - sm_89 (Ada Lovelace) on CUDA >= 11.8
       - sm_100/120 on CUDA >= 12.8
-      - sm_121 on CUDA >= 12.8
-      - Use 100f/120f on CUDA >= 12.9 (Blackwell family-specific)
-      - Embed PTX for newest arch for forward compatibility
+      - sm_121 on CUDA >= 12.8 (121f on CUDA >= 12.9)
+      - Use family-specific virtual architectures on CUDA >= 12.9
+      - Embed PTX for the newest supported arch for forward compatibility
       - Thor (sm_101/sm_110) is not built by this fork (see cuda_archs()).
     """
+    supported_archs = []
+
     # Always-regular 80
     if "80" in archs:
         cc_flag += ["-gencode", "arch=compute_80,code=sm_80"]
+        supported_archs.append("80")
 
     # Ada Lovelace 8.9 needs >= 11.8
     if bare_metal_version >= Version("11.8") and "89" in archs:
         cc_flag += ["-gencode", "arch=compute_89,code=sm_89"]
+        supported_archs.append("89")
 
     # Hopper 9.0 needs >= 11.8
     if bare_metal_version >= Version("11.8") and "90" in archs:
         cc_flag += ["-gencode", "arch=compute_90,code=sm_90"]
+        supported_archs.append("90")
 
     # Blackwell 10.x requires >= 12.8
     if bare_metal_version >= Version("12.8"):
@@ -162,6 +169,7 @@ def add_cuda_gencodes(cc_flag, archs, bare_metal_version):
                 cc_flag += ["-gencode", "arch=compute_100f,code=sm_100"]
             else:
                 cc_flag += ["-gencode", "arch=compute_100,code=sm_100"]
+            supported_archs.append("100")
 
         if "120" in archs:
             # sm_120 is supported in CUDA 12.8/12.9+ toolkits
@@ -169,21 +177,26 @@ def add_cuda_gencodes(cc_flag, archs, bare_metal_version):
                 cc_flag += ["-gencode", "arch=compute_120f,code=sm_120"]
             else:
                 cc_flag += ["-gencode", "arch=compute_120,code=sm_120"]
+            supported_archs.append("120")
 
         if "121" in archs:
-            # sm_121 is supported via compute_120(f)
             if bare_metal_version >= Version("12.9"):
-                cc_flag += ["-gencode", "arch=compute_120f,code=sm_121"]
+                cc_flag += ["-gencode", "arch=compute_121f,code=sm_121"]
             else:
                 cc_flag += ["-gencode", "arch=compute_120,code=sm_121"]
+            supported_archs.append("121")
 
         # Thor (sm_101/sm_110) is intentionally not built by this fork; see cuda_archs().
 
-    # PTX for newest requested arch (forward-compat)
-    numeric = [a for a in archs if a.isdigit()]
-    if numeric:
-        newest = max(numeric, key=int)
-        cc_flag += ["-gencode", f"arch=compute_{newest},code=compute_{newest}"]
+    if not supported_archs:
+        raise RuntimeError(
+            f"None of the requested CUDA architectures {sorted(archs)} "
+            f"are supported by CUDA {bare_metal_version}"
+        )
+
+    # PTX for newest supported requested arch (forward-compat)
+    newest = max(supported_archs, key=int)
+    cc_flag += ["-gencode", f"arch=compute_{newest},code=compute_{newest}"]
 
     return cc_flag
 
@@ -289,20 +302,39 @@ def get_ck_tile_bfloat16_supported_modes(ck_dir):
 cmdclass = {}
 ext_modules = []
 
+def check_system_aiter():
+    """Check an installed aiter provides the Triton kernels, without importing it: find_spec() on a
+    dotted name imports the parent, and importing aiter JIT-builds against a GPU the build has not got.
+    """
+    spec = importlib.util.find_spec("aiter")
+    locations = list(spec.submodule_search_locations or []) if spec is not None else []
+    kernels = os.path.join("ops", "triton", "_triton_kernels", "flash_attn_triton_amd")
+    if any(os.path.isdir(os.path.join(root, kernels)) for root in locations):
+        return
+    raise RuntimeError(
+        "FLASH_ATTENTION_USE_SYSTEM_AITER=TRUE was set, but no installed aiter provides "
+        f"aiter.{kernels.replace(os.sep, '.')}. Install a compatible aiter, or unset "
+        "FLASH_ATTENTION_USE_SYSTEM_AITER to build the bundled third_party/aiter."
+    )
+
+
 # We want this even if SKIP_CUDA_BUILD because when we run python setup.py sdist we want the .hpp
 # files included in the source distribution, in case the user compiles from source.
 if IS_ROCM:
     if ROCM_BACKEND == "triton":
-        if os.path.isdir(".git"):
-            subprocess.run(["git", "submodule", "update", "--init", "third_party/aiter"], check=True)
+        if USE_SYSTEM_AITER:
+            check_system_aiter()
         else:
-            assert os.path.isdir("third_party/aiter"), (
-                "third_party/aiter is missing, please use source distribution or git clone"
+            if os.path.isdir(".git"):
+                subprocess.run(["git", "submodule", "update", "--init", "third_party/aiter"], check=True)
+            else:
+                assert os.path.isdir("third_party/aiter"), (
+                    "third_party/aiter is missing, please use source distribution or git clone"
+                )
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--no-build-isolation", "third_party/aiter"],
+                check=True,
             )
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--no-build-isolation", "third_party/aiter"],
-            check=True,
-        )
     elif ROCM_BACKEND == "ck":
         if os.path.isdir(".git"):
             subprocess.run(["git", "submodule", "update", "--init", "csrc/composable_kernel"], check=True)
@@ -346,9 +378,17 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
     if FORCE_CXX11_ABI:
         torch._C._GLIBCXX_USE_CXX11_ABI = True
 
+    # PyTorch 2.13+ requires C++20 for extensions that include ATen headers
+    # (ATen raises "bit-field default initializer error" for 2.13,
+    # "#error C++20 or later ... required" for 2.14+). Because we pass an
+    # explicit -std flag below, PyTorch's build machinery cannot upgrade the
+    # standard for us, so select it from the installed torch version. Older
+    # torch keeps C++17 to avoid requiring a newer toolchain unnecessarily.
+    cxx_standard = "c++20" if (TORCH_MAJOR, TORCH_MINOR) >= (2, 13) else "c++17"
+
     nvcc_flags = [
     "-O3",
-    "-std=c++20",
+    f"-std={cxx_standard}",
     "-U__CUDA_NO_HALF_OPERATORS__",
     "-U__CUDA_NO_HALF_CONVERSIONS__",
     "-U__CUDA_NO_HALF2_OPERATORS__",
@@ -367,25 +407,27 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
     # "-DFLASHATTENTION_DISABLE_LOCAL",
     ]
 
-    compiler_c17_flag = ["-O3", "-std=c++20"]
+    compiler_cxx_flag = ["-O3", f"-std={cxx_standard}"]
     # Add Windows-specific flags
-    if sys.platform == "win32" and os.getenv("DISTUTILS_USE_SDK") == "1":
-        # CUDA 13.2 CCCL headers require MSVC conforming preprocessor
-        # (see md/CUDA_13.0_TO_13.2_BUILD_FIX.md). PyTorch 2.13 still omits
-        # /Zc:preprocessor from COMMON_MSVC_FLAGS, so add it explicitly.
-        nvcc_flags.extend(
-            ["-Xcompiler", "/Zc:__cplusplus", "-Xcompiler", "/Zc:preprocessor"]
-        )
-        compiler_c17_flag = [
+    if sys.platform == "win32" and os.getenv('DISTUTILS_USE_SDK') == '1':
+        nvcc_flags.extend([
+            "-Xcompiler", "/Zc:__cplusplus",
+            "-Xcompiler", "/Zc:preprocessor",
+            "-D_USE_MATH_DEFINES",
+        ])
+        compiler_cxx_flag = [
             "-O2",
-            "/std:c++20",
+            f"/std:{cxx_standard}",
             "/Zc:__cplusplus",
             "/Zc:preprocessor",
-            # M_LOG2E / M_LN2 etc. (same as hopper/setup.py); required after
-            # upstream #2669 stopped pulling ATen RNG headers into FA2 kernels.
             "-D_USE_MATH_DEFINES",
         ]
-        nvcc_flags.append("-D_USE_MATH_DEFINES")
+        # /std:c++20 implies /permissive-. MSVC 2022 (<19.50) then rejects CuTe
+        # templates (C3545 in cute/stride.hpp) with CUDA 13.x, so relax conformance
+        # for nvcc's host compilation only. Do not add it to the cl flags: torch's
+        # C++20 headers fail to compile under /permissive (C2666/C2139).
+        if cxx_standard == "c++20":
+            nvcc_flags += ["-Xcompiler", "/permissive"]
 
     # Opt-in: disable building dropout and its dependent headers (ATen philox/RNG
     # headers) from the FA2 build. This flag must be shared across both cxx and nvcc
@@ -497,7 +539,7 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
                 "csrc/flash_attn/src/flash_fwd_split_align_hdim256_bf16_causal_sm80.cu",
             ],
             extra_compile_args={
-                "cxx": compiler_c17_flag + feature_flags,
+                "cxx": compiler_cxx_flag + feature_flags,
                 "nvcc": append_nvcc_threads(nvcc_flags + cc_flag + feature_flags),
             },
             include_dirs=[
