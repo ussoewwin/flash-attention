@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.8.3 - 2026-10-30
+
+- **Summary:** Fork release **v1.8.3** / package **`flash_attn` 2.9.2.post2** - upstream sync merge (`76d93310` -> `a3a9dfa9`, 16 commits) and PyTorch **2.15.0+cu134** (Python 3.14, CUDA 13.4) MSVC Windows compatibility integration:
+  - **PyTorch 2.15.0+cu134 / CUDA 13.4 Build Integration (`setup2.py`):**
+    - **C++20 & MSVC `/permissive` Alignment:** Synchronized `setup2.py` with upstream compiler specification: dynamic C++ standard detection (`cxx_standard = "c++20"` for PyTorch >= 2.13) and nvcc host compilation flag `["-Xcompiler", "/permissive"]` to prevent MSVC 2022 strict conformance (`/permissive-`) from rejecting CuTe template instantiations (`C3545` in `cute/stride.hpp`) under C++20 with CUDA 13.x.
+    - **Math Constants (`-D_USE_MATH_DEFINES`):** Added `-D_USE_MATH_DEFINES` to Windows nvcc and MSVC compiler flags in `setup2.py`, exposing `M_LOG2E` from `<cmath>` for `softmax.h` and `flash_api.cpp`.
+    - **CUDA Architecture PTX Resolution (`add_cuda_gencodes`):** Tracked `supported_archs` accurately to select `newest = max(supported_archs, key=int)` for `arch=compute_{newest},code=compute_{newest}`, eliminating invalid virtual PTX targets (such as `compute_121`).
+    - **Windows Wheel Builder Integration:** Verified `WindowsWhlBuilder_cuda_2.bat` / `WindowsWhlBuilder_cuda_3.bat` parse `torch.version.cuda='13.4'` -> `cu134` and `torch.__version__='2.15.0+cu134'` -> `torch2.15.0`, successfully producing validated wheel binaries (e.g., `flash_attn-2.9.2.post2+cu134torch2.15.0cxx11abiTRUE.blackwell-cp314-cp314-win_amd64.whl`).
+  - **Upstream Sync Merge (`a3a9dfa9`):**
+    - **FA2 Paged KV CUDA Graph Sync Guard (`flash_api.cpp`):** Upstream #2984 eliminated host-device synchronization during CUDA graph capture in paged KV cache (`mha_fwd_kvcache`), ensuring safe graph capture and replay.
+    - **CuTe / FA4 SM100 Improvements:** Integrated hd256 backward unification steps 4/7 and 5/7 (#2967, #3058: dQ semaphore overlap release and GQA Q-tile packing), logical CLC tile coordinates (#3034), bound ragged K/V TMA loads with per-CTA descriptor updates (#3071, #3013, #3012), and NaN prevention from unused V cache entries (#2983).
+  - **Fork Preservation:** FA2 custom 24 `split_align` kernels (`flash_fwd_split_align_*.cu`), MSVC 2GB linker limit bypass (`bat2` Blackwell `100;120;121` vs `bat3` Legacy `80;89;90`), `sm_89` and `sm_121` gencode mappings, zero-CI policy, and clean test suite (`test_fa2.py` forward & backward pass verified) remain 100% intact.
+- **Release notes:** [v1.8.3 Release (GitHub)](https://github.com/ussoewwin/flash-attention/releases/tag/v1.8.3)
+
 ## v1.8.2 - 2026-10-07
 
 - **Summary:** Fork release **v1.8.2** / package **`flash_attn` 2.9.2.post2** - upstream sync merge (`ce088ab` -> `76d93310`, 47 commits). The upstream changes are FA4 / CuTe DSL focused (1CTA MLA forward, hd256 forward/backward unification, sparse MLA training precision, SM90 fixes, Windows CUDA 13 / PyTorch 2.13+ build support). **FA2 CUDA kernels (`csrc/flash_attn/`) are byte-identical to v1.8.1 (zero diff); the FA-2-relevant changes are confined to the build system:**
