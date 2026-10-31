@@ -42,6 +42,10 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 
+print(f"\n[FlashAttention Build] PyTorch version: {torch.__version__}")
+print(f"[FlashAttention Build] CUDA version: {torch.version.cuda}")
+print(f"[FlashAttention Build] CXX11 ABI: {torch._C._GLIBCXX_USE_CXX11_ABI}\n")
+
 if BUILD_TARGET == "auto":
     if IS_HIP_EXTENSION:
         IS_ROCM = True
@@ -180,8 +184,9 @@ def add_cuda_gencodes(cc_flag, archs, bare_metal_version):
             supported_archs.append("120")
 
         if "121" in archs:
+            # sm_121 is supported via compute_120(f)
             if bare_metal_version >= Version("12.9"):
-                cc_flag += ["-gencode", "arch=compute_121f,code=sm_121"]
+                cc_flag += ["-gencode", "arch=compute_120f,code=sm_121"]
             else:
                 cc_flag += ["-gencode", "arch=compute_120,code=sm_121"]
             supported_archs.append("121")
@@ -196,7 +201,12 @@ def add_cuda_gencodes(cc_flag, archs, bare_metal_version):
 
     # PTX for newest supported requested arch (forward-compat)
     newest = max(supported_archs, key=int)
-    cc_flag += ["-gencode", f"arch=compute_{newest},code=compute_{newest}"]
+    # sm_121 has no compute_121 virtual arch; map to compute_120(f)
+    ptx_arch = "120" if newest == "121" else newest
+    if ptx_arch in ("100", "120") and bare_metal_version >= Version("12.9"):
+        cc_flag += ["-gencode", f"arch=compute_{ptx_arch}f,code=compute_{ptx_arch}f"]
+    else:
+        cc_flag += ["-gencode", f"arch=compute_{ptx_arch},code=compute_{ptx_arch}"]
 
     return cc_flag
 
