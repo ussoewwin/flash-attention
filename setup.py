@@ -353,13 +353,14 @@ if IS_ROCM:
                 "csrc/composable_kernel is missing, please use source distribution or git clone"
             )
 else:
-    # CUDA: cutlass submodule
-    if os.path.isdir(".git"):
-        subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"], check=True)
-    else:
-        assert os.path.exists("csrc/cutlass/include/cutlass/cutlass.h"), (
-            "csrc/cutlass is missing, please use source distribution or git clone"
-        )
+    # CUDA: cutlass submodule (skip git submodule update if headers are already present)
+    if not os.path.exists("csrc/cutlass/include/cutlass/cutlass.h"):
+        if os.path.isdir(".git"):
+            subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"], check=True)
+        else:
+            assert os.path.exists("csrc/cutlass/include/cutlass/cutlass.h"), (
+                "csrc/cutlass is missing, please use source distribution or git clone"
+            )
 
 if not SKIP_CUDA_BUILD and not IS_ROCM:
     print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
