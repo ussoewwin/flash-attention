@@ -1,4 +1,4 @@
-Starting Windows wheel build job: win_whl_1
+Starting Windows wheel build job: win_whl_2
 Repo: D:\USERFILES\GitHub\flash-attention-official
 Python: D:\USERFILES\A1111\venv\Scripts\python.exe
 CUDA: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4
@@ -17,8 +17,3 @@ Requirement already satisfied: wheel in D:\USERFILES\A1111\venv\Lib\site-package
 Requirement already satisfied: psutil in D:\USERFILES\A1111\venv\Lib\site-packages (5.9.5)
 D:\USERFILES\A1111\venv\Lib\site-packages\wheel\bdist_wheel.py:4: FutureWarning: The 'wheel' package is no longer the canonical location of the 'bdist_wheel' command, and will be removed in a future release. Please update to setuptools v70.1 or later which contains an integrated version of this command.
   warn(
-
-[FlashAttention Build] PyTorch version: 2.15.0+cu134
-[FlashAttention Build] CUDA version: 13.4
-[FlashAttention Build] CXX11 ABI: True
-

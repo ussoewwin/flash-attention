@@ -32,6 +32,23 @@ from torch.utils.cpp_extension import (
     IS_HIP_EXTENSION,
 )
 
+# Auto-resolve CUDA_HOME if missing or pointing to non-existent directory (e.g. stale CUDA_PATH v13.2 vs installed v13.4)
+if CUDA_HOME is None or not os.path.exists(CUDA_HOME):
+    for candidate in [
+        os.environ.get("CUDA_HOME"),
+        os.environ.get("CUDA_PATH"),
+        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4",
+        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2",
+    ]:
+        if candidate and os.path.exists(candidate):
+            CUDA_HOME = candidate
+            os.environ["CUDA_HOME"] = candidate
+            os.environ["CUDA_PATH"] = candidate
+            cuda_bin = os.path.join(candidate, "bin")
+            if cuda_bin not in os.environ.get("PATH", ""):
+                os.environ["PATH"] = cuda_bin + os.pathsep + os.environ.get("PATH", "")
+            break
+
 
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
